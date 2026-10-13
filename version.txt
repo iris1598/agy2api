@@ -1,4 +1,4 @@
-full_hash=44a9b2626539fffdc2ffe9749c9bbcd9fa702c7a
-short_hash=44a9b26
-message=Update anti_truncation.py
-date=2026-10-08 17:31:27 +0800
+full_hash=5db146ebe65a702978d7de61136127e2ac057df5
+short_hash=5db146e
+message=Update utils.py
+date=2026-10-12 17:21:18 +0800

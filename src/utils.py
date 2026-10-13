@@ -20,9 +20,9 @@ def get_geminicli_user_agent(model: str = "") -> str:
 GEMINICLI_USER_AGENT = get_geminicli_user_agent()
 
 # Antigravity CLI 客户端仿真常量
-ANTIGRAVITY_CLI_VERSION = "1.2.12"
-ANTIGRAVITY_CLI_PLATFORM = "windows/amd64"
-ANTIGRAVITY_USER_AGENT = f"antigravity/cli/{ANTIGRAVITY_CLI_VERSION} {ANTIGRAVITY_CLI_PLATFORM}"
+ANTIGRAVITY_VERSION = "2.22.0"
+ANTIGRAVITY_PLATFORM = "darwin/arm64"
+ANTIGRAVITY_USER_AGENT = f"antigravity/hub/{ANTIGRAVITY_VERSION} {ANTIGRAVITY_PLATFORM}"
 
 # OAuth Configuration - 标准模式
 CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
@@ -58,6 +58,7 @@ BASE_MODELS = [
     "gemini-3.1-pro-preview",
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash",
+    "gemini-3.8-flash",
 ]
 
 

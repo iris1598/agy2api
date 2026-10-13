@@ -3154,18 +3154,17 @@ async function checkForUpdates() {
                 // 检查更新失败
                 showStatus(`检查更新失败: ${data.update_error || '未知错误'}`, 'error');
             } else if (data.has_update === true) {
-                // 有更新
-                const updateMsg = `发现新版本！\n当前: v${data.version}\n最新: v${data.latest_version}\n\n更新内容: ${data.latest_message || '无'}`;
-                showStatus(updateMsg.replace(/\n/g, ' '), 'warning');
+                // 有更新 - 仅提示，不提供自动更新入口
+                const updateMsg = `发现新版本！当前: v${data.version}  最新: v${data.latest_version}  更新内容: ${data.latest_message || '无'}`;
+                showStatus(updateMsg, 'warning');
 
-                // 更新按钮样式
                 checkBtn.style.backgroundColor = '#ffc107';
                 checkBtn.textContent = '有新版本';
 
                 setTimeout(() => {
                     checkBtn.style.backgroundColor = '#17a2b8';
                     checkBtn.textContent = originalText;
-                }, 5000);
+                }, 30000);
             } else if (data.has_update === false) {
                 // 已是最新
                 showStatus('已是最新版本！', 'success');
