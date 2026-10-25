@@ -143,6 +143,14 @@ async def messages(
             status_code
         )
 
+        # 政策拦截等错误体：返回 400 而不是上游的 200
+        if (
+            isinstance(anthropic_response, dict)
+            and anthropic_response.get("type") == "error"
+            and status_code == 200
+        ):
+            status_code = 400
+
         return JSONResponse(content=anthropic_response, status_code=status_code)
 
     # ========== 流式请求 ==========

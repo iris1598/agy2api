@@ -140,6 +140,14 @@ async def chat_completions(
             status_code
         )
 
+        # 政策拦截等错误体：返回 400 而不是上游的 200
+        if (
+            isinstance(openai_response, dict)
+            and "error" in openai_response
+            and status_code == 200
+        ):
+            status_code = 400
+
         return JSONResponse(content=openai_response, status_code=status_code)
 
     # ========== 流式请求 ==========

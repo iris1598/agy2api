@@ -37,6 +37,13 @@ from src.router.stream_passthrough import (
     read_first_async_item,
 )
 
+# 政策拦截检测（上游把政策拒绝文案当正常回复返回时转换为显式错误）
+from src.converter.policy_block import (
+    build_gemini_error,
+    contains_policy_marker,
+    is_policy_block_response,
+)
+
 # 本地模块 - 数据模型
 from src.models import GeminiRequest, model_to_dict
 
@@ -112,6 +119,18 @@ async def generate_content(
     try:
         if response.status_code == 200:
             response_data = json.loads(response.body if hasattr(response, 'body') else response.content)
+
+            # 政策拦截检测：必须对整个响应体做，且放在任何解包装分支之前！
+            # stream2nostream 聚合器会把 "response" 包装剥掉返回裸的
+            # {"candidates": [...]}，若检测写在解包装分支内，无包装响应会
+            # 直接跳过检测透传（拒绝文案泄漏的真实入口）。
+            # is_policy_block_response 自身兼容带包装/不带包装两种结构。
+            if is_policy_block_response(response_data):
+                log.warning("[POLICY_BLOCK] 非流式响应命中 Google 政策拦截")
+                return JSONResponse(
+                    content=build_gemini_error(), status_code=400
+                )
+
             # 如果有 response 包装，解包装它
             if "response" in response_data:
                 unwrapped_data = response_data["response"]
@@ -119,6 +138,22 @@ async def generate_content(
         # 错误响应或没有 response 字段，直接返回
         return response
     except Exception as e:
+        # 坑2：上游可能直接吐 SSE 文本（非 JSON），解析失败走这里。
+        # 对原始文本做原文级兜底扫描，命中返回错误并打印响应片段，
+        # 再遇到未知结构时日志直接给出答案。
+        raw_body = (
+            response.body.decode("utf-8", errors="replace")
+            if isinstance(getattr(response, "body", None), bytes)
+            else str(getattr(response, "body", "") or "")
+        )
+        if response.status_code == 200 and contains_policy_marker(raw_body):
+            log.warning(
+                f"[POLICY_BLOCK] 非流式响应体非JSON且命中政策拦截标记，"
+                f"响应片段: {raw_body[:200]!r}"
+            )
+            return JSONResponse(
+                content=build_gemini_error(), status_code=400
+            )
         log.warning(f"Failed to unwrap response: {e}, returning original response")
         return response
 
