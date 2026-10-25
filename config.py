@@ -53,6 +53,15 @@ ENV_MAPPINGS = {
     "PORT": "port",
     "API_PASSWORD": "api_password",
     "PANEL_PASSWORD": "panel_password",
+    "RATE_LIMIT_ENABLED": "rate_limit_enabled",
+    "RATE_LIMIT_MAX_CONCURRENT": "rate_limit_max_concurrent",
+    "RATE_LIMIT_REQUESTS_PER_WINDOW": "rate_limit_requests_per_window",
+    "RATE_LIMIT_WINDOW_SECONDS": "rate_limit_window_seconds",
+    "REQUEST_THROTTLE_ENABLED": "request_throttle_enabled",
+    "REQUEST_MIN_INTERVAL": "request_min_interval",
+    "REQUEST_JITTER": "request_jitter",
+    "REQUEST_SERIAL_ENABLED": "request_serial_enabled",
+    "STREAM_READ_TIMEOUT": "stream_read_timeout",
 }
 
 
@@ -789,3 +798,184 @@ async def get_antigravity_api_url() -> str:
             "ANTIGRAVITY_API_URL",
         )
     )
+async def get_rate_limit_enabled() -> bool:
+    """
+    Get rate limit enabled setting.
+
+    是否启用并发/速率控制。
+
+    Environment variable: RATE_LIMIT_ENABLED
+    Database config key: rate_limit_enabled
+    Default: False
+    """
+    env_value = os.getenv("RATE_LIMIT_ENABLED")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+
+    return bool(await get_config_value("rate_limit_enabled", False))
+
+
+async def get_rate_limit_max_concurrent() -> int:
+    """
+    Get max concurrent requests.
+
+    同一时刻最多处理的请求数，0 表示不限制并发。
+
+    Environment variable: RATE_LIMIT_MAX_CONCURRENT
+    Database config key: rate_limit_max_concurrent
+    Default: 5
+    """
+    env_value = os.getenv("RATE_LIMIT_MAX_CONCURRENT")
+    if env_value:
+        try:
+            return max(0, int(env_value))
+        except ValueError:
+            pass
+
+    return int(await get_config_value("rate_limit_max_concurrent", 5))
+
+
+async def get_rate_limit_requests_per_window() -> int:
+    """
+    Get max requests per window.
+
+    时间窗口（秒）内最多处理的请求数。
+
+    Environment variable: RATE_LIMIT_REQUESTS_PER_WINDOW
+    Database config key: rate_limit_requests_per_window
+    Default: 20
+    """
+    env_value = os.getenv("RATE_LIMIT_REQUESTS_PER_WINDOW")
+    if env_value:
+        try:
+            return max(0, int(env_value))
+        except ValueError:
+            pass
+
+    return int(await get_config_value("rate_limit_requests_per_window", 20))
+
+
+async def get_rate_limit_window_seconds() -> int:
+    """
+    Get rate limit window in seconds.
+
+    速率统计的时间窗口长度（秒）。
+
+    Environment variable: RATE_LIMIT_WINDOW_SECONDS
+    Database config key: rate_limit_window_seconds
+    Default: 60
+    """
+    env_value = os.getenv("RATE_LIMIT_WINDOW_SECONDS")
+    if env_value:
+        try:
+            return max(1, int(env_value))
+        except ValueError:
+            pass
+
+    return int(await get_config_value("rate_limit_window_seconds", 60))
+
+
+async def get_request_throttle_enabled() -> bool:
+    """
+    Get request throttle enabled setting.
+
+    是否启用单账号请求节流（防封禁）。
+
+    Environment variable: REQUEST_THROTTLE_ENABLED
+    Database config key: request_throttle_enabled
+    Default: False
+    """
+    env_value = os.getenv("REQUEST_THROTTLE_ENABLED")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+
+    return bool(await get_config_value("request_throttle_enabled", False))
+
+
+async def get_request_min_interval() -> float:
+    """
+    Get minimum interval between requests.
+
+    相邻两次请求之间的最小间隔（秒）。
+
+    Environment variable: REQUEST_MIN_INTERVAL
+    Database config key: request_min_interval
+    Default: 2.0
+    """
+    env_value = os.getenv("REQUEST_MIN_INTERVAL")
+    if env_value:
+        try:
+            return max(0.0, float(env_value))
+        except ValueError:
+            pass
+
+    return float(await get_config_value("request_min_interval", 2.0))
+
+
+async def get_request_jitter() -> float:
+    """
+    Get request jitter range.
+
+    每次请求额外附加的随机抖动上限（秒），实际抖动在 [0, jitter] 内随机。
+
+    Environment variable: REQUEST_JITTER
+    Database config key: request_jitter
+    Default: 2.0
+    """
+    env_value = os.getenv("REQUEST_JITTER")
+    if env_value:
+        try:
+            return max(0.0, float(env_value))
+        except ValueError:
+            pass
+
+    return float(await get_config_value("request_jitter", 2.0))
+
+
+async def get_request_serial_enabled() -> bool:
+    """
+    Get request serial mode setting.
+
+    串行模式：上一个请求【结束后】再发送下一个请求（间隔从结束时刻起算），
+    严格排队、请求之间不重叠。适合 Antigravity CLI 等单账号/单会话场景。
+
+    Environment variable: REQUEST_SERIAL_ENABLED
+    Database config key: request_serial_enabled
+    Default: False
+    """
+    env_value = os.getenv("REQUEST_SERIAL_ENABLED")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+
+    return bool(await get_config_value("request_serial_enabled", False))
+
+
+async def get_stream_read_timeout() -> float:
+    """
+    Get streaming read timeout (seconds).
+
+    上游流式响应「相邻两次网络读取之间」的最大空闲时长。超过后抛出
+    httpx.ReadTimeout，防止上游流中途挂起导致：
+    - 串行模式下回合锁永久占用（后续所有请求死锁，只能重启）
+    - 并发名额泄漏（限流开启时逐渐耗尽所有名额）
+
+    注意这是「块间空闲」超时而不是整个响应的总时长上限：只要上游持续
+    有数据到达就会不断重置计时，正常的超长生成（如 1M 上下文）不受影响。
+    设为 0 或负数可禁用（恢复旧的无限等待行为，不建议）。
+
+    Environment variable: STREAM_READ_TIMEOUT
+    Database config key: stream_read_timeout
+    Default: 300.0
+    """
+    env_value = os.getenv("STREAM_READ_TIMEOUT")
+    if env_value:
+        try:
+            return max(0.0, float(env_value))
+        except ValueError:
+            pass
+
+    try:
+        value = float(await get_config_value("stream_read_timeout", 300.0))
+    except (TypeError, ValueError):
+        return 300.0
+    return max(0.0, value)

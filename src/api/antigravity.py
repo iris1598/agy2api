@@ -26,6 +26,7 @@ from src.credential_manager import (
     get_valid_credential,
 )
 from src.httpx_client import stream_post_async, post_async
+from src.request_pacer import request_pacer
 from src.models import Model, model_to_dict
 from src.utils import ANTIGRAVITY_USER_AGENT
 
@@ -415,6 +416,9 @@ async def stream_request(
         return True
 
     for attempt in range(max_retries + 1):
+        # 防封禁：请求节流 + 随机抖动（每次发送前调用）
+        await request_pacer.pace()
+
         success_recorded = False  # 标记是否已记录成功
         need_retry = False  # 标记是否需要重试
         usage_tokens: Dict[str, int] = {}  # 从流中提取的 token 用量
@@ -603,6 +607,12 @@ async def stream_request(
 
         except Exception as e:
             log.error(f"[ANTIGRAVITY STREAM] 流式请求异常: {e}, 凭证: {current_file}")
+            if success_recorded:
+                # 已经向客户端发送过部分内容，重试会导致整个响应从头重发（内容重复）。
+                # 只能结束当前流（客户端表现为截断，可配合抗截断前缀使用）。
+                log.error("[ANTIGRAVITY STREAM] 流中途异常且已发送部分内容，结束流而不重试")
+                await _log_stream_result(500, False, f"异常(已发送部分内容,不重试): {e}")
+                return
             if attempt < max_retries:
                 log.info(f"[ANTIGRAVITY STREAM] 异常后重试 (attempt {attempt + 2}/{max_retries + 1})...")
                 # 本次上游调用（异常）产生一条日志
@@ -780,6 +790,9 @@ async def non_stream_request(
         return True
 
     for attempt in range(max_retries + 1):
+        # 防封禁：请求节流 + 随机抖动（每次发送前调用）
+        await request_pacer.pace()
+
         need_retry = False  # 标记是否需要重试
         attempt_start_time = time.time()  # 本次上游调用开始时间
         

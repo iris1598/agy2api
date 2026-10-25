@@ -73,6 +73,19 @@ async def get_config(token: str = Depends(verify_panel_token)):
         # 凭证选择模式
         current_config["credential_select_mode"] = await config.get_credential_select_mode()
 
+        # 并发与速率控制配置
+        current_config["rate_limit_enabled"] = await config.get_rate_limit_enabled()
+        current_config["rate_limit_max_concurrent"] = await config.get_rate_limit_max_concurrent()
+        current_config["rate_limit_requests_per_window"] = await config.get_rate_limit_requests_per_window()
+        current_config["rate_limit_window_seconds"] = await config.get_rate_limit_window_seconds()
+
+        # 请求节流与抖动配置（防封禁）
+        current_config["request_throttle_enabled"] = await config.get_request_throttle_enabled()
+        current_config["request_min_interval"] = await config.get_request_min_interval()
+        current_config["request_jitter"] = await config.get_request_jitter()
+        current_config["request_serial_enabled"] = await config.get_request_serial_enabled()
+        current_config["stream_read_timeout"] = await config.get_stream_read_timeout()
+
         # 服务器配置
         current_config["host"] = await config.get_server_host()
         current_config["port"] = await config.get_server_port()
@@ -246,6 +259,74 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
             if mode not in ("random", "cache", "sticky"):
                 raise HTTPException(status_code=400, detail="凭证选择模式必须是 random / cache / sticky")
 
+        # 验证并发与速率控制配置
+        if "rate_limit_enabled" in new_config:
+            if not isinstance(new_config["rate_limit_enabled"], bool):
+                raise HTTPException(status_code=400, detail="限流开关必须是布尔值")
+
+        if "rate_limit_max_concurrent" in new_config:
+            try:
+                concurrent = int(new_config["rate_limit_max_concurrent"])
+                if concurrent < 0:
+                    raise HTTPException(status_code=400, detail="最大并发数必须大于等于0")
+                new_config["rate_limit_max_concurrent"] = concurrent
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail="最大并发数必须是有效整数")
+
+        if "rate_limit_requests_per_window" in new_config:
+            try:
+                requests = int(new_config["rate_limit_requests_per_window"])
+                if requests < 1:
+                    raise HTTPException(status_code=400, detail="窗口内最大请求数必须大于等于1")
+                new_config["rate_limit_requests_per_window"] = requests
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail="窗口内最大请求数必须是有效整数")
+
+        if "rate_limit_window_seconds" in new_config:
+            try:
+                window = int(new_config["rate_limit_window_seconds"])
+                if window < 1 or window > 86400:
+                    raise HTTPException(status_code=400, detail="限流时间窗口必须在1-86400秒之间")
+                new_config["rate_limit_window_seconds"] = window
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail="限流时间窗口必须是有效整数")
+
+        # 验证请求节流与抖动配置（防封禁）
+        if "request_throttle_enabled" in new_config:
+            if not isinstance(new_config["request_throttle_enabled"], bool):
+                raise HTTPException(status_code=400, detail="请求节流开关必须是布尔值")
+
+        if "request_min_interval" in new_config:
+            try:
+                interval = float(new_config["request_min_interval"])
+                if interval < 0 or interval > 3600:
+                    raise HTTPException(status_code=400, detail="最小请求间隔必须在0-3600秒之间")
+                new_config["request_min_interval"] = interval
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail="最小请求间隔必须是有效的数字")
+
+        if "request_jitter" in new_config:
+            try:
+                jitter = float(new_config["request_jitter"])
+                if jitter < 0 or jitter > 3600:
+                    raise HTTPException(status_code=400, detail="抖动范围必须在0-3600秒之间")
+                new_config["request_jitter"] = jitter
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail="抖动范围必须是有效的数字")
+
+        if "request_serial_enabled" in new_config:
+            if not isinstance(new_config["request_serial_enabled"], bool):
+                raise HTTPException(status_code=400, detail="串行模式开关必须是布尔值")
+
+        if "stream_read_timeout" in new_config:
+            try:
+                value = float(new_config["stream_read_timeout"])
+                if value < 0 or value > 86400:
+                    raise HTTPException(status_code=400, detail="上游流式读超时必须在0-86400秒之间")
+                new_config["stream_read_timeout"] = value
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail="上游流式读超时必须是有效的数字")
+
         # 验证服务器配置
         if "host" in new_config:
             if not isinstance(new_config["host"], str) or not new_config["host"].strip():
@@ -280,6 +361,35 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
 
         # 重新加载配置缓存（关键！）
         await config.reload_config()
+
+        # 如果限流相关配置发生变化，立即刷新限流器配置（热更新）
+        rate_limit_keys = {
+            "rate_limit_enabled",
+            "rate_limit_max_concurrent",
+            "rate_limit_requests_per_window",
+            "rate_limit_window_seconds",
+        }
+        if rate_limit_keys & set(new_config.keys()):
+            try:
+                from src.rate_limiter import rate_limiter
+                await rate_limiter.refresh_config()
+            except Exception as e:
+                log.warning(f"刷新限流配置失败: {e}")
+
+        # 如果请求节流相关配置发生变化，立即刷新节流器配置（热更新）
+        request_throttle_keys = {
+            "request_throttle_enabled",
+            "request_min_interval",
+            "request_jitter",
+            "request_serial_enabled",
+        }
+        if request_throttle_keys & set(new_config.keys()):
+            try:
+                from src.request_pacer import request_pacer
+                await request_pacer.refresh_config()
+            except Exception as e:
+                log.warning(f"刷新请求节流配置失败: {e}")
+
 
         # 验证保存后的结果
         test_api_password = await config.get_api_password()

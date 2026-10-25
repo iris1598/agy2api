@@ -52,6 +52,25 @@ const CONFIG_GROUPS = [
     ],
   },
   {
+    title: "并发与速率控制",
+    fields: [
+      { key: "rate_limit_enabled", label: "启用限流", type: "bool", note: "对聊天 API 请求进行并发数与时间窗口速率限制，超过返回 429。保存后立即生效（热更新）" },
+      { key: "rate_limit_max_concurrent", label: "最大并发数", type: "number", showIf: (cfg) => !!cfg.rate_limit_enabled, note: "同一时刻最多处理的请求数，0 表示不限制（默认 5）。流式响应会持续占用名额直到传输完成" },
+      { key: "rate_limit_requests_per_window", label: "窗口内最大请求数", type: "number", showIf: (cfg) => !!cfg.rate_limit_enabled, note: "时间窗口内最多处理的请求数（默认 20）" },
+      { key: "rate_limit_window_seconds", label: "限流时间窗口（秒）", type: "number", showIf: (cfg) => !!cfg.rate_limit_enabled, note: "速率统计的时间窗口长度，1-86400 秒（默认 60）" },
+    ],
+  },
+  {
+    title: "请求节流（防封禁）",
+    fields: [
+      { key: "request_throttle_enabled", label: "启用请求节流", type: "bool", note: "每次向上游发送聊天请求前等待\"最小间隔 + 随机抖动\"，抹平请求节奏、降低单账号被封风险。保存后立即生效（热更新）" },
+      { key: "request_min_interval", label: "最小请求间隔（秒）", type: "number", showIf: (cfg) => !!cfg.request_throttle_enabled, note: "相邻两次请求之间的最小间隔，0-3600 秒（默认 2.0）。保守建议 2~5 秒" },
+      { key: "request_jitter", label: "随机抖动上限（秒）", type: "number", showIf: (cfg) => !!cfg.request_throttle_enabled, note: "每次请求额外附加 [0, 上限] 内的随机抖动（默认 2.0）。建议 2~3 秒" },
+      { key: "request_serial_enabled", label: "串行模式", type: "bool", showIf: (cfg) => !!cfg.request_throttle_enabled, note: "上一个请求【结束后】再发送下一个（间隔从结束时刻起算），严格排队不重叠，适合 Antigravity CLI 单账号/单会话场景。需同时开启请求节流" },
+      { key: "stream_read_timeout", label: "上游流式读超时（秒）", type: "number", note: "上游流式响应相邻两次数据之间的最大空闲时长（默认 300）。超过即报错并释放请求，防止串行回合锁/并发名额被挂起的流永久占用导致死锁。持续有数据时计时不断重置，超长生成不受影响；设为 0 禁用（不建议）" },
+    ],
+  },
+  {
     title: "凭证选择模式",
     fields: [
       {

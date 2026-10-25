@@ -22,6 +22,7 @@ from src.router.antigravity.gemini import router as antigravity_gemini_router
 from src.router.antigravity.anthropic import router as antigravity_anthropic_router
 from src.router.antigravity.model_list import router as antigravity_model_list_router
 from src.panel import router as panel_router
+from src.rate_limiter import RateLimitMiddleware
 
 
 @asynccontextmanager
@@ -145,6 +146,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 并发/速率控制中间件（对聊天 API 请求进行限流，配置见控制面板）
+app.add_middleware(RateLimitMiddleware)
 
 # IP 白名单中间件（需在最外层，先于 CORS 与所有路由执行）
 app.add_middleware(IPWhitelistMiddleware)

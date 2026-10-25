@@ -20,6 +20,11 @@ from src.converter.thoughtSignature_fix import (
     is_skip_thought_signature_placeholder,
     SKIP_THOUGHT_SIGNATURE_VALIDATOR,
 )
+from src.converter.policy_block import (
+    PolicyBlockStreamDetector,
+    build_anthropic_error as _build_policy_block_anthropic_error,
+    is_policy_block_response as _is_policy_block_response,
+)
 
 DEFAULT_TEMPERATURE = 0.4
 _DEBUG_TRUE = {"1", "true", "yes", "on"}
@@ -829,6 +834,14 @@ def gemini_to_anthropic_response(
     else:
         response_data = gemini_response
 
+    # 政策拦截检测：上游把内容政策拒绝文案当正常回复（200 + finishReason=STOP）
+    # 返回，这里转换为显式的 Anthropic 错误体，避免被当成正文输出
+    if _is_policy_block_response(response_data):
+        log.warning(
+            "[POLICY_BLOCK] 非流式响应命中 Google 政策拦截，转换为错误响应"
+        )
+        return _build_policy_block_anthropic_error()
+
     # 提取候选结果
     candidate = response_data.get("candidates", [{}])[0] or {}
     parts = candidate.get("content", {}).get("parts", []) or []
@@ -975,6 +988,9 @@ async def gemini_stream_to_anthropic_stream(
     reasoning_tokens = 0
     finish_reason: Optional[str] = None
     stream_finished = False  # finishReason 收尾块之后只消费不转换（保持上游流走完以记录请求日志）
+    # 政策拦截跨 chunk 检测器（本生成器内局部状态，无需全局字典）
+    policy_detector = PolicyBlockStreamDetector()
+    policy_decided = False
 
     def _sse_event(event: str, data: Dict[str, Any]) -> bytes:
         """生成 SSE 事件"""
@@ -1172,6 +1188,32 @@ async def gemini_stream_to_anthropic_stream(
                     if isinstance(text, str) and not text.strip():
                         continue
 
+                    # 政策拦截跨 chunk 检测：上游会把内容政策拒绝文案当正常
+                    # 回复流式返回，且可能拆成多个 chunk，在流开头缓冲匹配。
+                    if not policy_decided:
+                        state, released = policy_detector.feed(text)
+                        if state == "blocked":
+                            # 命中拦截：关闭当前块，发送错误事件并终止流
+                            log.warning(
+                                "[POLICY_BLOCK] 流式响应命中 Google 政策拦截: "
+                                f"{text[:120]}"
+                            )
+                            close_evt = _close_block()
+                            if close_evt:
+                                yield close_evt
+                            yield _sse_event(
+                                "error",
+                                _build_policy_block_anthropic_error(text),
+                            )
+                            return
+                        if state == "hold":
+                            # 尚不能判定，扣留文本（不开启内容块）
+                            continue
+                        # 正常文本：释放缓冲（含此前扣留的内容）
+                        policy_decided = True
+                        if released:
+                            text = released
+
                     if current_block_type != "text":
                         close_evt = _close_block()
                         if close_evt:
@@ -1263,6 +1305,35 @@ async def gemini_stream_to_anthropic_stream(
                 # 不 break：继续消费上游残余块（如 [DONE]），保证底层
                 # stream_request 走正常收尾路径记录请求日志（issue #438）
                 stream_finished = True
+
+        # 流结束前释放政策拦截检测器仍在扣留的文本（未完成判定的缓冲），
+        # 避免文本丢失
+        if not policy_decided:
+            flush_state, flushed = policy_detector.flush()
+            if flush_state == "emit" and flushed:
+                if current_block_type != "text":
+                    close_evt = _close_block()
+                    if close_evt:
+                        yield close_evt
+                    current_block_index += 1
+                    current_block_type = "text"
+                    yield _sse_event(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": current_block_index,
+                            "content_block": {"type": "text", "text": ""},
+                        },
+                    )
+                yield _sse_event(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": current_block_index,
+                        "delta": {"type": "text_delta", "text": flushed},
+                    },
+                )
+            policy_decided = True
 
         # 关闭最后的内容块
         close_evt = _close_block()

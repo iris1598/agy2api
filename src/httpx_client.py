@@ -11,7 +11,7 @@ from typing import Any, AsyncGenerator, Dict, Optional
 
 import httpx
 
-from config import get_proxy_config
+from config import get_proxy_config, get_stream_read_timeout
 from log import log
 
 
@@ -42,7 +42,30 @@ async def get_client(
 async def get_streaming_client(
     timeout: float = None, **kwargs
 ) -> AsyncGenerator[httpx.AsyncClient, None]:
-    """获取用于流式请求的HTTP客户端（无超时限制）"""
+    """获取用于流式请求的HTTP客户端。
+
+    timeout=None 时启用分阶段超时（防上游挂起）：
+    - read 超时来自配置 STREAM_READ_TIMEOUT（默认 300s，0=禁用），
+      作用于「相邻两次网络读取之间」的空闲时长。上游流中途卡死
+      （连接保持但不再发数据）超过该时长即抛出 httpx.ReadTimeout，
+      否则串行模式下的回合锁 / 限流并发名额会被永久占用，形成死锁。
+    - connect/write/pool 使用固定 30s。
+    只要上游持续有数据到达，read 计时就会不断重置，
+    正常的超长流式生成不受影响。
+
+    显式传入 timeout 时沿用调用方指定的值（兼容旧行为）。
+    """
+    if timeout is None:
+        read_timeout = await get_stream_read_timeout()
+        if read_timeout > 0:
+            timeout = httpx.Timeout(
+                connect=30.0,
+                read=read_timeout,
+                write=30.0,
+                pool=30.0,
+            )
+        # read_timeout <= 0：用户显式禁用，保持 timeout=None（无限等待）
+
     client_kwargs = await get_client_kwargs(timeout=timeout, **kwargs)
 
     # 创建独立的客户端实例用于流式处理

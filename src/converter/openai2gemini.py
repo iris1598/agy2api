@@ -17,6 +17,11 @@ from src.converter.thoughtSignature_fix import (
     is_skip_thought_signature_placeholder,
     SKIP_THOUGHT_SIGNATURE_VALIDATOR,
 )
+from src.converter.policy_block import (
+    PolicyBlockStreamDetector,
+    build_openai_error as _build_policy_block_openai_error,
+    is_policy_block_response as _is_policy_block_response,
+)
 from src.converter.utils import merge_system_messages
 
 from log import log
@@ -31,6 +36,42 @@ _STREAM_TOOL_INDEX: "OrderedDict[str, int]" = OrderedDict()
 #: 上限：流被中途放弃（客户端断开、没有带 finishReason 的收尾块）时不会回收，
 #: 用 LRU 淘汰兜底，避免长期运行的实例无界增长。
 _STREAM_TOOL_INDEX_MAX_ENTRIES = 512
+
+#: 流式政策拦截检测器（按 response_id）。
+#: Gemini CLI 后端把政策拒绝文案当正常回复流式返回，且可能拆成多个 chunk，
+#: 需要在流的开头缓冲文本做前缀匹配。命中后保留哨兵直到流收尾，用于抑制
+#: 后续 chunk；同样用 LRU 淘汰兜底防止无界增长。
+_POLICY_BLOCK_DETECTORS: "OrderedDict[str, PolicyBlockStreamDetector]" = OrderedDict()
+_POLICY_BLOCK_DETECTORS_MAX_ENTRIES = 512
+_BLOCKED_STREAM_SENTINEL = PolicyBlockStreamDetector()  # 已命中拦截的哨兵实例
+
+
+def _get_policy_block_detector(response_id: str) -> Optional[PolicyBlockStreamDetector]:
+    """获取该流的检测器；返回 None 表示该流已判定为正常文本（无需再检测）。
+
+    命中拦截后写入哨兵实例，后续 chunk 一律抑制。
+    """
+    detector = _POLICY_BLOCK_DETECTORS.get(response_id)
+    if detector is _BLOCKED_STREAM_SENTINEL:
+        return detector
+    if detector is None:
+        return None
+    if detector.blocked:
+        # 惰性升级为哨兵，feed() 直接返回 blocked
+        _POLICY_BLOCK_DETECTORS[response_id] = _BLOCKED_STREAM_SENTINEL
+        return _BLOCKED_STREAM_SENTINEL
+    return detector
+
+
+def _set_policy_block_detector(response_id: str, detector: PolicyBlockStreamDetector) -> None:
+    _POLICY_BLOCK_DETECTORS[response_id] = detector
+    _POLICY_BLOCK_DETECTORS.move_to_end(response_id)
+    while len(_POLICY_BLOCK_DETECTORS) > _POLICY_BLOCK_DETECTORS_MAX_ENTRIES:
+        _POLICY_BLOCK_DETECTORS.popitem(last=False)
+
+
+def _cleanup_policy_block_detector(response_id: str) -> None:
+    _POLICY_BLOCK_DETECTORS.pop(response_id, None)
 
 
 def _next_stream_tool_call_indices(response_id: str, count: int) -> List[int]:
@@ -1627,6 +1668,14 @@ def convert_gemini_to_openai_response(
     if "response" in gemini_response:
         gemini_response = gemini_response["response"]
 
+    # 政策拦截检测：上游把内容政策拒绝文案当正常回复（200 + finishReason=STOP）
+    # 返回，这里转换为显式的 OpenAI 错误体，避免被当成正文输出
+    if _is_policy_block_response(gemini_response):
+        log.warning(
+            "[POLICY_BLOCK] 非流式响应命中 Google 政策拦截，转换为 content_filter 错误"
+        )
+        return _build_policy_block_openai_error()
+
     # 转换为 OpenAI 格式
     choices = []
 
@@ -1802,6 +1851,15 @@ def convert_gemini_to_openai_stream(
     else:
         gemini_response = gemini_chunk
 
+    # 该流已命中政策拦截：抑制后续所有 chunk，直到收尾块（携带 finishReason）后清理状态
+    if _POLICY_BLOCK_DETECTORS.get(response_id) is _BLOCKED_STREAM_SENTINEL:
+        if any(
+            isinstance(c, dict) and c.get("finishReason")
+            for c in (gemini_response.get("candidates") or [])
+        ):
+            _cleanup_policy_block_detector(response_id)
+        return None
+
     # 转换为 OpenAI 流式格式
     choices = []
 
@@ -1817,6 +1875,36 @@ def convert_gemini_to_openai_stream(
 
         # 提取工具调用和文本内容 (流式需要 index)
         tool_calls, text_content = extract_tool_calls_from_parts(parts, is_streaming=True)
+
+        # 政策拦截跨 chunk 检测：上游会把内容政策拒绝文案当正常回复流式返回，
+        # 且可能拆成多个 chunk，需要在流开头缓冲文本做前缀匹配。
+        # 仅针对普通文本；思考内容与工具调用不受影响。
+        if text_content and not tool_calls:
+            detector = _POLICY_BLOCK_DETECTORS.get(response_id)
+            if detector is None or detector is _BLOCKED_STREAM_SENTINEL:
+                detector = PolicyBlockStreamDetector()
+            state, released = detector.feed(text_content)
+            if state == "blocked":
+                log.warning(
+                    "[POLICY_BLOCK] 流式响应命中 Google 政策拦截: "
+                    f"{text_content[:120]}"
+                )
+                _set_policy_block_detector(response_id, _BLOCKED_STREAM_SENTINEL)
+                return f"data: {json.dumps(_build_policy_block_openai_error(text_content))}\n\n"
+            if state == "hold":
+                # 尚不能判定，扣留文本；思考内容照常透传
+                _set_policy_block_detector(response_id, detector)
+                text_content = ""
+            else:
+                # 正常文本：释放缓冲（含此前扣留的内容）
+                if released:
+                    text_content = released
+                # 保留已判定的检测器，后续 chunk 的 feed() 直接返回 emit
+                _set_policy_block_detector(response_id, detector)
+        elif tool_calls:
+            # 出现工具调用说明是正常业务流，停止检测
+            if _POLICY_BLOCK_DETECTORS.get(response_id) not in (None, _BLOCKED_STREAM_SENTINEL):
+                _cleanup_policy_block_detector(response_id)
 
         # extract_tool_calls_from_parts 给出的 index 是 chunk 内 parts 下标，
         # 对并行调用恒为 0。改用流内递增序号，客户端才能把它们归并成独立调用。
@@ -1900,6 +1988,13 @@ def convert_gemini_to_openai_stream(
         # 导致只输出思考内容或只返回第一个工具调用就结束。
         if gemini_finish_reason:
             finish_reason = _map_finish_reason(gemini_finish_reason)
+            # 收尾块：若政策拦截检测器仍在扣留文本（流意外结束、未完成判定），
+            # 释放扣留的缓冲，避免文本丢失
+            detector = _POLICY_BLOCK_DETECTORS.get(response_id)
+            if detector is not None and detector is not _BLOCKED_STREAM_SENTINEL:
+                _flush_state, flushed = detector.flush()
+                if _flush_state == "emit" and flushed:
+                    delta["content"] = (delta.get("content") or "") + flushed
         else:
             finish_reason = None
         
@@ -1917,9 +2012,10 @@ def convert_gemini_to_openai_stream(
             "finish_reason": finish_reason,
         })
 
-    # 流已收尾，回收该 response_id 占用的工具调用序号
+    # 流已收尾，回收该 response_id 占用的工具调用序号与政策拦截检测器
     if any(choice.get("finish_reason") for choice in choices):
         _STREAM_TOOL_INDEX.pop(response_id, None)
+        _cleanup_policy_block_detector(response_id)
 
     # 转换 usageMetadata (只在流结束时存在)
     usage = _convert_usage_metadata(gemini_response.get("usageMetadata"))
