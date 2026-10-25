@@ -243,7 +243,7 @@ else
         rm -rf ./agy2api
     fi
     
-    if ! git clone https://github.com/su-kaka/agy2api.git; then
+    if ! git clone https://github.com/iris1598/gcli2api.git; then
         log_error "Failed to clone repository"
         exit 1
     fi

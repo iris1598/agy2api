@@ -4,7 +4,7 @@
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: CNC-1.0](https://img.shields.io/badge/License-CNC--1.0-red.svg)](../LICENSE)
-[![Docker](https://img.shields.io/badge/docker-available-blue.svg)](https://github.com/su-kaka/agy2api/pkgs/container/agy2api)
+[![Docker](https://img.shields.io/badge/docker-available-blue.svg)](https://github.com/iris1598/gcli2api/pkgs/container/agy2api)
 
 [中文](../README.md) | English | [日本語](./README_JA.md)
 
@@ -16,7 +16,7 @@
 
 **Initial Installation**
 ```bash
-curl -o termux-install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/termux-install.sh" && chmod +x termux-install.sh && ./termux-install.sh
+curl -o termux-install.sh "https://raw.githubusercontent.com/iris1598/gcli2api/refs/heads/master/termux-install.sh" && chmod +x termux-install.sh && ./termux-install.sh
 ```
 
 **Restart Service**
@@ -29,7 +29,7 @@ bash termux-start.sh
 
 **Initial Installation**
 ```powershell
-iex (iwr "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/install.ps1" -UseBasicParsing).Content
+iex (iwr "https://raw.githubusercontent.com/iris1598/gcli2api/refs/heads/master/install.ps1" -UseBasicParsing).Content
 ```
 
 **Restart Service**
@@ -39,7 +39,7 @@ Double-click to execute `start.bat`
 
 **Initial Installation**
 ```bash
-curl -o install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/install.sh" && chmod +x install.sh && ./install.sh
+curl -o install.sh "https://raw.githubusercontent.com/iris1598/gcli2api/refs/heads/master/install.sh" && chmod +x install.sh && ./install.sh
 ```
 
 **Restart Service**
@@ -52,7 +52,7 @@ bash start.sh
 
 **Initial Installation**
 ```bash
-curl -o darwin-install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/darwin-install.sh" && chmod +x darwin-install.sh && ./darwin-install.sh
+curl -o darwin-install.sh "https://raw.githubusercontent.com/iris1598/gcli2api/refs/heads/master/darwin-install.sh" && chmod +x darwin-install.sh && ./darwin-install.sh
 ```
 
 **Restart Service**

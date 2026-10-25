@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "CNC-1.0"}
 authors = [
-    {name = "su-kaka"}
+    {name = "iris1598"}
 ]
 keywords = ["gemini", "openai", "api", "converter", "cli"]
 classifiers = [

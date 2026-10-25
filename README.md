@@ -4,7 +4,7 @@
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: CNC-1.0](https://img.shields.io/badge/License-CNC--1.0-red.svg)](LICENSE)
-[![Docker](https://img.shields.io/badge/docker-available-blue.svg)](https://github.com/su-kaka/agy2api/pkgs/container/agy2api)
+[![Docker](https://img.shields.io/badge/docker-available-blue.svg)](https://github.com/iris1598/gcli2api/pkgs/container/agy2api)
 
 [English](docs/README_EN.md) | 中文 | [日本語](docs/README_JA.md)
 
@@ -16,7 +16,7 @@
 
 **初始安装**
 ```bash
-curl -o termux-install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/termux-install.sh" && chmod +x termux-install.sh && ./termux-install.sh
+curl -o termux-install.sh "https://raw.githubusercontent.com/iris1598/gcli2api/refs/heads/master/termux-install.sh" && chmod +x termux-install.sh && ./termux-install.sh
 ```
 
 **重启服务**
@@ -29,7 +29,7 @@ bash termux-start.sh
 
 **初始安装**
 ```powershell
-iex (iwr "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/install.ps1" -UseBasicParsing).Content
+iex (iwr "https://raw.githubusercontent.com/iris1598/gcli2api/refs/heads/master/install.ps1" -UseBasicParsing).Content
 ```
 
 **重启服务**
@@ -39,7 +39,7 @@ iex (iwr "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/in
 
 **初始安装**
 ```bash
-curl -o install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/install.sh" && chmod +x install.sh && ./install.sh
+curl -o install.sh "https://raw.githubusercontent.com/iris1598/gcli2api/refs/heads/master/install.sh" && chmod +x install.sh && ./install.sh
 ```
 
 **重启服务**
@@ -52,7 +52,7 @@ bash start.sh
 
 **初始安装**
 ```bash
-curl -o darwin-install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/darwin-install.sh" && chmod +x darwin-install.sh && ./darwin-install.sh
+curl -o darwin-install.sh "https://raw.githubusercontent.com/iris1598/gcli2api/refs/heads/master/darwin-install.sh" && chmod +x darwin-install.sh && ./darwin-install.sh
 ```
 
 **重启服务**
@@ -211,6 +211,32 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 - `RETRY_429_MAX_RETRIES`: 最大重试次数（默认：5）
 - `RETRY_429_INTERVAL`: 重试间隔，秒（默认：1）
 - `ANTI_TRUNCATION_MAX_ATTEMPTS`: 抗截断最大重试次数（默认：3）
+
+**并发与速率控制配置（可在控制面板"配置管理"中设置并热更新）**
+- `RATE_LIMIT_ENABLED`: 启用限流（默认：false）
+- `RATE_LIMIT_MAX_CONCURRENT`: 同一时刻最大并发请求数，0 表示不限（默认：5）
+- `RATE_LIMIT_REQUESTS_PER_WINDOW`: 时间窗口内最大请求数（默认：20）
+- `RATE_LIMIT_WINDOW_SECONDS`: 限流时间窗口，秒（默认：60）
+
+> 超过限制的请求会返回 HTTP 429。并发控制覆盖 /v1、/v1beta 的聊天 API 请求，流式响应会持续占用并发名额直到传输完成。
+
+**请求节流与抖动配置（单账号防封禁，可在控制面板设置并热更新）**
+- `REQUEST_THROTTLE_ENABLED`: 启用请求节流（默认：false）
+- `REQUEST_MIN_INTERVAL`: 相邻两次请求之间的最小间隔，秒（默认：2.0）
+- `REQUEST_JITTER`: 每次请求附加的随机抖动上限，秒，实际值在 [0, 上限] 内随机（默认：2.0）
+- `REQUEST_SERIAL_ENABLED`: 串行模式开关（默认：false，需同时开启 REQUEST_THROTTLE_ENABLED 才生效）
+
+**上游流式读超时（防死锁，可在控制面板设置并热更新）**
+- `STREAM_READ_TIMEOUT`: 上游流式响应相邻两次数据之间的最大空闲时长，秒（默认：300）
+- 上游流中途卡死（连接保持但不再发数据）超过该时长即报错并释放请求，防止串行模式回合锁 / 限流并发名额被永久占用导致后续所有请求死锁
+- 只要上游持续有数据到达就会不断重置计时，正常的超长生成（如 1M 上下文）不受影响；设为 0 可禁用（不建议）
+
+> 启用请求节流后，在每次向上游发送聊天请求前等待"最小间隔 + 随机抖动"，把请求节奏抹平滑、降低单账号被识别为自动化突发并封禁的风险。单账号保守建议设置 最小间隔 2~5 秒 + 抖动 2~3 秒。
+> **串行模式**：间隔从上一个请求的【结束时刻】起算，请求严格排队、不重叠发送，适合 Antigravity CLI 等单账号/单会话场景。
+> 与并发控制的关系：并发限制在请求入口计数（满了返回 429）、请求节流在发送给 Google 前排队等待（不拒绝）。两者可同时开启，节流负责抹平上游节奏、并发上限只作兜底保护；若节流间隔较大，建议把并发上限设大一些或设为 0（不限）。
+
+**政策拦截检测（内置，无需配置）**
+- 上游触发 Google 内容政策拒绝时会把固定拒绝文案当"正常回复"（HTTP 200）返回，本 fork 内置检测（`src/converter/policy_block.py`），在 OpenAI / Gemini / Claude 三种格式的流式与非流式路径上将其转换为显式错误（HTTP 400），避免拒绝文案被当成正文输出
 
 **自动化配置**
 - `AUTO_BAN`: 启用凭证自动封禁（默认：false）
