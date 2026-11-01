@@ -9,11 +9,12 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from config import get_usage_log_enabled
 from log import log
 from src.request_body_log import clear_request_body_logs, read_request_body_log
-from src.storage.database import get_database
+from src.storage.database import UsageLog, get_database
 from src.usage_log import clear_usage_logs
 from src.utils import verify_panel_token
 
@@ -127,12 +128,7 @@ async def clear_logs(
 @router.post("/truncate")
 async def truncate_logs(token: str = Depends(verify_panel_token)):
     """清空日志：直接 DROP 整张 usage_log 表并重建，不留任何残留"""
-    from fastapi import Response as FastAPIResponse
-
     try:
-        from src.storage.database import UsageLog
-        from sqlalchemy import text
-
         database = await get_database()
         # 先统计当前条数用于返回
         _, total = await database.query_usage_logs(offset=0, limit=1)

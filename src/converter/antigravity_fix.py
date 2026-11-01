@@ -10,10 +10,18 @@ Antigravity Format Utilities - 独立的 Antigravity 请求处理和转换工具
 - 使用 print 输出 warning/error，去掉 debug 日志
 """
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from config import (
+    apply_sensitive_word_filter,
+    get_model_rewrite_filter,
+    get_return_thoughts_to_frontend,
+    get_sensitive_word_filter,
+    rewrite_model_name,
+)
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
 
 # ==================== 常量配置 ====================
@@ -493,8 +501,6 @@ def _parse_size_to_image_config(size_str: str) -> Dict[str, str]:
     Returns:
         包含 aspectRatio 和/或 imageSize 的字典
     """
-    import re
-
     config = {}
     size_str = size_str.strip()
 
@@ -601,7 +607,6 @@ _UPSTREAM_ALIASES: Dict[str, str] = {
 
 async def _get_model_rewrite_rules():
     """读取生效的模型名复写规则；未启用时返回 None"""
-    from config import get_model_rewrite_filter
     enabled, rules = await get_model_rewrite_filter()
     return rules if enabled and rules else None
 
@@ -675,14 +680,12 @@ def _apply_thinking(profile: ModelProfile, generation_config: Dict[str, Any], re
 
 async def _get_sensitive_word_patterns():
     """读取生效的敏感词正则列表；未启用时返回 None（避免无谓的配置读取开销为 0 时的开销可忽略）"""
-    from config import get_sensitive_word_filter
     enabled, patterns = await get_sensitive_word_filter()
     return patterns if enabled and patterns else None
 
 
 def _filter_text(text: str, patterns) -> str:
     """对文本应用敏感词过滤（大小写不敏感，命中替换为空）"""
-    from config import apply_sensitive_word_filter
     return apply_sensitive_word_filter(text, patterns)
 
 
@@ -865,16 +868,13 @@ async def normalize_antigravity_request(
     result = request.copy()
     model = result.get("model", "")
     generation_config = (result.get("generationConfig") or {}).copy()
-
-    # 项目固定为 True（原版从 config 读取 return_thoughts，本项目无此配置项）
-    return_thoughts = True
+    return_thoughts = await get_return_thoughts_to_frontend()
 
     # ========== 0.5 模型名复写（面板可配，热更新） ==========
     # 在抗截断前缀剥离之后、profile 解析之前应用：
     # 命中规则的模型名被替换为规则指定的模型名（支持正则与反向引用）
     rewrite_rules = await _get_model_rewrite_rules()
     if rewrite_rules and model:
-        from config import rewrite_model_name
         rewritten = rewrite_model_name(model, rewrite_rules)
         if rewritten != model:
             result["model"] = rewritten

@@ -6,10 +6,12 @@
 无状态函数风格：无全局实例，每次调用独立构建/销毁客户端
 """
 
+import json
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, Optional
 
 import httpx
+from fastapi import Response
 
 from config import get_proxy_config, get_stream_read_timeout
 from log import log
@@ -114,8 +116,6 @@ async def stream_post_async(
 ):
     """流式异步POST请求"""
     if _MOCK_STREAM_429:
-        from fastapi import Response
-        import json
         log.warning(f"[MOCK] stream_post_async: 返回模拟429错误")
         yield Response(
             content=json.dumps({"error": {"code": 429, "message": "mock rate limit", "status": "RESOURCE_EXHAUSTED"}}),
@@ -127,7 +127,6 @@ async def stream_post_async(
         async with client.stream("POST", url, json=body, headers=headers) as r:
             # 错误直接返回
             if r.status_code != 200:
-                from fastapi import Response
                 yield Response(await r.aread(), r.status_code, dict(r.headers))
                 return
 

@@ -3,6 +3,8 @@ Anthropic Router - Handles Anthropic/Claude format API requests via Antigravity
 通过Antigravity处理Anthropic/Claude格式请求的路由模块
 """
 
+# 标准库
+import json
 import sys
 from pathlib import Path
 
@@ -11,11 +13,8 @@ project_root = Path(__file__).resolve().parent.parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-# 标准库
-import json
-
 # 第三方库
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 # 本地模块 - 配置和日志
@@ -42,6 +41,21 @@ from src.models import ClaudeRequest, model_to_dict
 
 # 本地模块 - Token估算
 from src.token_estimator import estimate_input_tokens
+
+# 本地模块 - API 层
+from src.api.antigravity import non_stream_request, stream_request
+
+# 本地模块 - 转换器
+from src.converter.anthropic2gemini import (
+    anthropic_to_gemini_request,
+    gemini_to_anthropic_response,
+    gemini_stream_to_anthropic_stream,
+)
+from src.converter.antigravity_fix import normalize_antigravity_request
+from src.converter.anti_truncation import (
+    AntiTruncationStreamProcessor,
+    apply_anti_truncation,
+)
 
 
 # ==================== 路由器初始化 ====================
@@ -89,14 +103,12 @@ async def messages(
     normalized_dict["model"] = real_model
 
     # 转换为 Gemini 格式 (使用 converter)
-    from src.converter.anthropic2gemini import anthropic_to_gemini_request
     gemini_dict = await anthropic_to_gemini_request(normalized_dict)
 
     # anthropic_to_gemini_request 不包含 model 字段，需要手动添加
     gemini_dict["model"] = real_model
 
     # 规范化 Gemini 请求 (使用 antigravity 模式)
-    from src.converter.antigravity_fix import normalize_antigravity_request
     gemini_dict = await normalize_antigravity_request(gemini_dict)
 
     # 准备API请求格式 - 提取model并将其他字段放入request中
@@ -115,7 +127,6 @@ async def messages(
     # ========== 非流式请求 ==========
     if not is_streaming:
         # 调用 API 层的非流式请求
-        from src.api.antigravity import non_stream_request
         response = await non_stream_request(body=api_request, log_ctx=log_ctx)
 
         # 检查响应状态码
@@ -136,7 +147,6 @@ async def messages(
             raise HTTPException(status_code=500, detail="Response parsing failed")
 
         # 转换为 Anthropic 格式
-        from src.converter.anthropic2gemini import gemini_to_anthropic_response
         anthropic_response = gemini_to_anthropic_response(
             gemini_response,
             real_model,
@@ -157,12 +167,6 @@ async def messages(
 
     # ========== 流式抗截断生成器 ==========
     async def anti_truncation_generator():
-        from src.converter.anti_truncation import AntiTruncationStreamProcessor
-        from src.api.antigravity import stream_request
-        from src.converter.anti_truncation import apply_anti_truncation
-        from src.converter.anthropic2gemini import gemini_stream_to_anthropic_stream
-        from fastapi import Response
-
         max_attempts = await get_anti_truncation_max_attempts()
 
         # 首先对payload应用反截断指令
@@ -216,10 +220,6 @@ async def messages(
 
     # ========== 普通流式生成器 ==========
     async def normal_stream_generator():
-        from src.api.antigravity import stream_request
-        from fastapi import Response
-        from src.converter.anthropic2gemini import gemini_stream_to_anthropic_stream
-
         # 调用 API 层的流式请求（不使用 native 模式）
         stream_gen = stream_request(body=api_request, native=False, log_ctx=log_ctx)
         try:
@@ -240,7 +240,6 @@ async def messages(
                     try:
                         error_content = chunk.body if isinstance(chunk.body, bytes) else (chunk.body or b'').encode('utf-8')
                         gemini_error = json.loads(error_content.decode('utf-8'))
-                        from src.converter.anthropic2gemini import gemini_to_anthropic_response
                         anthropic_error = gemini_to_anthropic_response(
                             gemini_error,
                             real_model,

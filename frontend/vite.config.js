@@ -2,6 +2,9 @@ import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
 export default defineConfig({
+  // 相对基径：构建产物中的 JS/CSS 等资源引用相对于页面地址解析，
+  // 支持把面板反向代理到任意子路径（如 /AGY2API/）下访问
+  base: "./",
   plugins: [react()],
   server: {
     port: 3000,

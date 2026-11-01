@@ -130,6 +130,32 @@ class IPWhitelistMiddleware:
         await self.app(scope, receive, send)
 
 
+class PathPrefixMiddleware:
+    """
+    路径前缀剥离中间件（纯 ASGI）
+
+    反代保留路径前缀时（如 location /AGY2API/ 搭配不带 URI 的 proxy_pass），
+    请求路径形如 /AGY2API/xxx。配置 PATH_PREFIX 后，中间件在路由匹配前
+    剥掉该前缀；未配置时请求原样下发。
+    """
+
+    def __init__(self, app, prefix: str):
+        self.app = app
+        self.prefix = prefix
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if path == self.prefix or path.startswith(self.prefix + "/"):
+                scope["path"] = path[len(self.prefix):] or "/"
+                raw_path = scope.get("raw_path")
+                if isinstance(raw_path, bytes) and raw_path.startswith(
+                    self.prefix.encode("ascii")
+                ):
+                    scope["raw_path"] = raw_path[len(self.prefix):] or b"/"
+        await self.app(scope, receive, send)
+
+
 # 创建FastAPI应用
 app = FastAPI(
     title="AGY2API",
@@ -152,6 +178,13 @@ app.add_middleware(RateLimitMiddleware)
 
 # IP 白名单中间件（需在最外层，先于 CORS 与所有路由执行）
 app.add_middleware(IPWhitelistMiddleware)
+
+# 路径前缀剥离中间件（配置 PATH_PREFIX 时启用，先于白名单与所有路由执行，
+# 使反代保留前缀的请求按剥掉前缀后的路径匹配路由）
+path_prefix = os.environ.get("PATH_PREFIX", "").rstrip("/")
+if path_prefix:
+    app.add_middleware(PathPrefixMiddleware, prefix=path_prefix)
+    log.info(f"已启用路径前缀剥离: {path_prefix}")
 
 # 挂载路由器
 # Antigravity路由 - 处理OpenAI格式请求并转换为Antigravity API

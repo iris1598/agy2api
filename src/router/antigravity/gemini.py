@@ -3,20 +3,21 @@ Gemini Router - Handles native Gemini format API requests (Antigravity backend)
 处理原生Gemini格式请求的路由模块（Antigravity后端）
 """
 
+# 标准库
+import json
 import sys
-from pathlib import Path
+import traceback
+from pathlib import Path as _PathlibPath
 
 # 添加项目根目录到Python路径
-project_root = Path(__file__).resolve().parent.parent.parent.parent
+project_root = _PathlibPath(__file__).resolve().parent.parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-# 标准库
-import json
-
 # 第三方库
-from fastapi import APIRouter, Depends, HTTPException, Path, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.testclient import TestClient
 
 # 本地模块 - 配置和日志
 from config import get_anti_truncation_max_attempts
@@ -46,6 +47,16 @@ from src.converter.policy_block import (
 
 # 本地模块 - 数据模型
 from src.models import GeminiRequest, model_to_dict
+
+# 本地模块 - API 层
+from src.api.antigravity import non_stream_request, stream_request
+
+# 本地模块 - 转换器
+from src.converter.antigravity_fix import normalize_antigravity_request
+from src.converter.anti_truncation import (
+    AntiTruncationStreamProcessor,
+    apply_anti_truncation,
+)
 
 
 # ==================== 路由器初始化 ====================
@@ -93,7 +104,6 @@ async def generate_content(
     normalized_dict["model"] = real_model
 
     # 规范化 Gemini 请求 (使用 antigravity 模式)
-    from src.converter.antigravity_fix import normalize_antigravity_request
     normalized_dict = await normalize_antigravity_request(normalized_dict)
 
     # 准备API请求格式 - 提取model并将其他字段放入request中
@@ -103,7 +113,6 @@ async def generate_content(
     }
 
     # 调用 API 层的非流式请求
-    from src.api.antigravity import non_stream_request
     response = await non_stream_request(
         body=api_request,
         log_ctx={
@@ -194,12 +203,6 @@ async def stream_generate_content(
 
     # ========== 流式抗截断生成器 ==========
     async def anti_truncation_generator():
-        from src.converter.antigravity_fix import normalize_antigravity_request
-        from src.converter.anti_truncation import AntiTruncationStreamProcessor
-        from src.converter.anti_truncation import apply_anti_truncation
-        from src.api.antigravity import stream_request
-        from fastapi import Response
-
         # 先进行基础标准化
         normalized_req = await normalize_antigravity_request(normalized_dict.copy())
 
@@ -282,10 +285,6 @@ async def stream_generate_content(
 
     # ========== 普通流式生成器 ==========
     async def normal_stream_generator():
-        from src.converter.antigravity_fix import normalize_antigravity_request
-        from src.api.antigravity import stream_request
-        from fastapi import Response
-
         normalized_req = await normalize_antigravity_request(normalized_dict.copy())
 
         # 准备API请求格式 - 提取model并将其他字段放入request中
@@ -413,9 +412,6 @@ if __name__ == "__main__":
     测试代码：演示Gemini路由的流式和非流式响应
     运行方式: python src/router/antigravity/gemini.py
     """
-
-    from fastapi.testclient import TestClient
-    from fastapi import FastAPI
 
     print("=" * 80)
     print("Gemini Router (Antigravity Backend) 测试")
@@ -598,5 +594,4 @@ if __name__ == "__main__":
 
     except Exception as e:
         print(f"\n❌ 测试过程中出现异常: {e}")
-        import traceback
         traceback.print_exc()

@@ -1,10 +1,12 @@
 import { ExternalLink, Github, Info, RefreshCw, Rocket, Zap } from "lucide-react";
+import { getBasePath } from "../basePath.js";
 
 export default function About({ version, onCheckUpdate, checkingUpdate }) {
+  const apiBase = `${window.location.origin}${getBasePath()}`;
   const apiEndpoints = [
-    { label: "OpenAI 格式", value: `${window.location.origin}/v1/chat/completions` },
-    { label: "Gemini 格式", value: `${window.location.origin}/v1beta/models` },
-    { label: "Claude 格式", value: `${window.location.origin}/v1/messages` },
+    { label: "OpenAI 格式", value: `${apiBase}v1/chat/completions` },
+    { label: "Gemini 格式", value: `${apiBase}v1beta/models` },
+    { label: "Claude 格式", value: `${apiBase}v1/messages` },
   ];
 
   const copyText = (text) => {
@@ -134,7 +136,7 @@ export default function About({ version, onCheckUpdate, checkingUpdate }) {
         <p className="text-gray-400 text-sm mb-3">欢迎加入 QQ 群交流讨论！</p>
         <div className="inline-block bg-white rounded-xl p-3">
           <img
-            src="/docs/qq-group.jpg"
+            src={`${getBasePath()}docs/qq-group.jpg`}
             alt="QQ 群二维码"
             className="w-40 h-40 rounded-lg"
           />

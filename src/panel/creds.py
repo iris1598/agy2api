@@ -32,6 +32,7 @@ from src.utils import (
     ANTIGRAVITY_CLIENT_SECRET,
 )
 from src.api.antigravity import fetch_quota_info, build_antigravity_headers
+from src.httpx_client import post_async
 from src.google_oauth_api import (
     Credentials,
     fetch_project_id_and_tier,
@@ -750,8 +751,6 @@ async def test_credential(
         access_token = credential_data.get("access_token") or credential_data.get("token")
         if not access_token:
             raise HTTPException(status_code=400, detail="凭证中没有访问令牌")
-
-        from src.httpx_client import post_async
 
         project_id = credential_data.get("project_id", "")
         if not project_id:

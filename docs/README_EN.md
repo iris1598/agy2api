@@ -328,6 +328,7 @@ Import/export uses a standardized JSON format: `{"refresh_token": "...", "email"
 - `PROXY`: Proxy address (supports `http://`, `https://`, `socks5://`, `socks5h://`, optionally with credentials `user:pass@host:port`)
 - `OAUTH_PROXY_URL`: OAuth authentication proxy endpoint
 - `GOOGLEAPIS_PROXY_URL`: Google APIs proxy endpoint
+- `PATH_PREFIX`: When the reverse proxy preserves the path prefix (e.g. `/AGY2API`), set this so the backend strips it before routing; default: empty (no stripping)
 
 **Automation Configuration**
 - `AUTO_BAN`: Enable automatic credential banning (default: false)

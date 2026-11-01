@@ -12,6 +12,8 @@ import shutil
 import time
 from typing import Any, Dict, Optional
 
+import aiofiles
+
 from log import log
 
 # 详细日志根目录（相对工作目录）
@@ -49,8 +51,6 @@ async def record_request_body(
     写入一条请求体详细日志（磁盘 JSON）。
     返回相对路径索引（写入失败返回 None）。任何异常不影响主流程。
     """
-    import aiofiles
-
     ts = time.time()
     date_dir = time.strftime("%Y-%m-%d", time.localtime(ts))
     rel_dir = os.path.join(REQUEST_LOG_DIR, date_dir)

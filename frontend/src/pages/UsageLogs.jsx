@@ -56,6 +56,7 @@ export default function UsageLogs() {
   const [detail, setDetail] = useState(null);
   const [detailBody, setDetailBody] = useState(null);
   const [detailBodyLoading, setDetailBodyLoading] = useState(false);
+  const [copyStatus, setCopyStatus] = useState(null); // null | "ok" | "fail"，请求体详细日志复制结果，弹窗内就地反馈
 
   // 时间范围（小时）
   const [rangeHours, setRangeHours] = useState(24);
@@ -143,6 +144,7 @@ export default function UsageLogs() {
   // 请求体详细日志：按索引从磁盘读取
   const openRequestBody = async () => {
     if (!detail?.request_log_file) return;
+    setCopyStatus(null);
     setDetailBodyLoading(true);
     try {
       const res = await api.get("/usage-logs/request-body", { params: { path: detail.request_log_file } });
@@ -157,12 +159,28 @@ export default function UsageLogs() {
 
   const copyDetailBody = async () => {
     if (!detailBody || detailBody.__missing) return;
+    const text = JSON.stringify(detailBody, null, 2);
+    let ok = false;
     try {
-      await navigator.clipboard.writeText(JSON.stringify(detailBody, null, 2));
-      setMessage({ type: "success", text: "已复制详细日志 JSON" });
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      } else {
+        // 非安全上下文（http + 局域网 IP）下 navigator.clipboard 不可用，退回 execCommand 兜底
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.top = "-9999px";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
     } catch {
-      setMessage({ type: "error", text: "复制失败" });
+      ok = false;
     }
+    setCopyStatus(ok ? "ok" : "fail");
   };
 
   return (
@@ -445,6 +463,8 @@ export default function UsageLogs() {
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-base font-semibold text-purple-400">请求体详细日志</h3>
               <div className="flex items-center gap-2">
+                {copyStatus === "ok" && <span className="text-xs text-green-400">已复制</span>}
+                {copyStatus === "fail" && <span className="text-xs text-red-400">复制失败</span>}
                 <button onClick={copyDetailBody} className="btn btn-secondary text-xs px-3 py-1.5">
                   复制 JSON
                 </button>

@@ -2,6 +2,8 @@
 配置路由模块 - 处理 /config/* 相关的HTTP请求
 """
 
+import re
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -164,7 +166,6 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
             words = new_config["sensitive_words"]
             if not isinstance(words, list):
                 raise HTTPException(status_code=400, detail="敏感词列表必须是数组（每行一个词）")
-            import re as _re
 
             cleaned_words = []
             for word in words:
@@ -174,8 +175,8 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
                 if not word:
                     continue
                 try:
-                    _re.compile(_re.escape(word), _re.IGNORECASE | _re.UNICODE)
-                except _re.error:
+                    re.compile(re.escape(word), re.IGNORECASE | re.UNICODE)
+                except re.error:
                     raise HTTPException(status_code=400, detail=f"无效的敏感词: {word!r}")
                 cleaned_words.append(word)
             new_config["sensitive_words"] = cleaned_words
@@ -209,8 +210,6 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
                 raise HTTPException(status_code=400, detail="模型名复写开关必须是布尔值")
 
         if "model_rewrite_rules" in new_config:
-            import re as _re_rw
-
             rules = new_config["model_rewrite_rules"]
             if not isinstance(rules, list):
                 raise HTTPException(status_code=400, detail="模型名复写规则必须是数组（每条 [匹配正则, 替换模型名]）")
@@ -225,8 +224,8 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
                 if not pattern or not replacement:
                     raise HTTPException(status_code=400, detail=f"规则的正则和替换模型名均不能为空: {rule!r}")
                 try:
-                    _re_rw.compile(pattern)
-                except _re_rw.error:
+                    re.compile(pattern)
+                except re.error:
                     raise HTTPException(status_code=400, detail=f"无效的正则表达式: {pattern!r}")
                 cleaned_rules.append([pattern, replacement])
             new_config["model_rewrite_rules"] = cleaned_rules

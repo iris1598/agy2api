@@ -13,13 +13,9 @@ from typing import Any, Dict, Optional, Tuple
 from log import log
 
 from config import get_credential_select_mode
+from src import session_cache
 from src.google_oauth_api import Credentials
 from src.storage.database import get_database
-
-try:
-    from src import session_cache
-except ImportError:  # 允许独立导入（测试场景）
-    session_cache = None
 
 # sticky 模式的当前粘性凭证（进程内唯一状态；重置函数供测试使用）
 _sticky_email: Optional[str] = None
@@ -273,7 +269,7 @@ async def refresh_token(
             credential_data["access_token"] = creds.access_token
             credential_data["token"] = creds.access_token
         if creds.expires_at:
-            credential_data["expiry"] = creds.expires_at
+            credential_data["expiry"] = creds.expires_at.isoformat() if hasattr(creds.expires_at, "isoformat") else str(creds.expires_at)
 
         await database.store_credential(email, credential_data)
         log.info(f"Token刷新成功并已保存: {email}")

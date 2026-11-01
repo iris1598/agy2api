@@ -315,7 +315,8 @@ class Database:
             client_id = credential_data.get("client_id") or ""
             client_secret = credential_data.get("client_secret") or ""
             project_id = credential_data.get("project_id") or ""
-            expiry = credential_data.get("expiry") or ""
+            expiry_val = credential_data.get("expiry") or ""
+            expiry = expiry_val.isoformat() if hasattr(expiry_val, "isoformat") else str(expiry_val)
             tier = credential_data.get("tier")
 
             if row:

@@ -1,8 +1,51 @@
 import { Loader2, Plus, RefreshCw, Save, Trash2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
+
+// 错误码输入：编辑期间保留原始文本，仅在按键时把已解析的数组回写配置（保证保存时取到最新值），
+// 失焦时再归一化显示。原实现在每次按键即时解析并回写数组，导致分隔符与未成形的中间输入被即时
+// 过滤/截断，无法输入多个错误码，也无法输入小于 100 的中间数字。
+function CsvNumbersField({ value, onChange, placeholder }) {
+  const toText = (v) => (Array.isArray(v) ? v.join(", ") : (v ?? ""));
+  const [text, setText] = useState(() => toText(value));
+  const focusedRef = useRef(false);
+
+  // 仅在非编辑态（失焦）时同步外部配置变化，避免编辑过程中被即时覆盖
+  useEffect(() => {
+    if (!focusedRef.current) setText(toText(value));
+  }, [value]);
+
+  const commitText = (raw) => {
+    const nums = raw
+      .split(/[,\s]+/)
+      .map((x) => parseInt(x, 10))
+      .filter((n) => Number.isInteger(n) && n >= 100 && n <= 599);
+    onChange([...new Set(nums)].sort((a, b) => a - b));
+  };
+
+  return (
+    <input
+      type="text"
+      value={text}
+      onFocus={() => {
+        focusedRef.current = true;
+      }}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setText(raw);
+        commitText(raw);
+      }}
+      onBlur={() => {
+        focusedRef.current = false;
+        commitText(text);
+      }}
+      placeholder={placeholder}
+      className="w-full sm:w-64 px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500 font-mono"
+    />
+  );
+}
 
 const CONFIG_GROUPS = [
   {
@@ -262,20 +305,11 @@ export default function Config() {
     }
 
     if (field.type === "csv_numbers") {
-      const text = Array.isArray(value) ? value.join(", ") : value || "";
       return (
-        <input
-          type="text"
-          value={text}
-          onChange={(e) => {
-            const nums = e.target.value
-              .split(/[,\s]+/)
-              .map((x) => parseInt(x, 10))
-              .filter((n) => Number.isInteger(n) && n >= 100 && n <= 599);
-            setField(field.key, [...new Set(nums)]);
-          }}
+        <CsvNumbersField
+          value={value}
+          onChange={(v) => setField(field.key, v)}
           placeholder={field.placeholder}
-          className="w-full sm:w-64 px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500 font-mono"
         />
       );
     }

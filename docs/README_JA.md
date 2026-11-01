@@ -324,6 +324,7 @@ agy2apiは2つのストレージバックエンドに対応: **ローカルSQLit
 - `PROXY`: プロキシアドレス（`http://`、`https://`、`socks5://`、`socks5h://` 対応、`user:pass@host:port` 形式の認証情報付きも可）
 - `OAUTH_PROXY_URL`: OAuth認証プロキシエンドポイント
 - `GOOGLEAPIS_PROXY_URL`: Google APIsプロキシエンドポイント
+- `PATH_PREFIX`: リバースプロキシがパスプレフィックスを保持する場合（例: `/AGY2API`）、バックエンドがルーティング前にプレフィックスを剥がすよう設定。デフォルト: 空（剥がさない）
 
 **自動化設定**
 - `AUTO_BAN`: クレデンシャル自動BANの有効化（デフォルト: false）

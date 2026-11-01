@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 
 from log import log
 
+from src.httpx_client import get_async
+
 
 # 创建路由器
 router = APIRouter(prefix="/version", tags=["version"])
@@ -58,8 +60,6 @@ async def get_version_info(check_update: bool = False):
         # 如果需要检查更新
         if check_update:
             try:
-                from src.httpx_client import get_async
-
                 # 直接获取GitHub上的version.txt文件
                 github_version_url = "https://raw.githubusercontent.com/iris1598/gcli2api/refs/heads/master/version.txt"
 

@@ -205,6 +205,7 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 - `OAUTH_PROXY_URL`: OAuth 认证代理端点
 - `GOOGLEAPIS_PROXY_URL`: Google APIs 代理端点
 - `ANTIGRAVITY_API_URL`: Antigravity API 端点
+- `PATH_PREFIX`: 反代保留路径前缀（如 `/AGY2API`）时配置，由后端在路由匹配前剥掉该前缀；默认：空（不剥离）
 
 **性能和稳定性配置**
 - `RETRY_429_ENABLED`: 启用错误自动重试（默认：true）

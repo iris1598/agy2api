@@ -13,13 +13,16 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
-from config import get_config_value, get_antigravity_api_url
+import oauthlib.oauth2.rfc6749.parameters
+
+from config import get_config_value, get_antigravity_api_url, get_panel_password
 from log import log
 
 from .google_oauth_api import (
     Credentials,
     Flow,
     fetch_project_id_and_tier,
+    get_user_email,
 )
 from .storage.database import get_database
 from .utils import (
@@ -74,8 +77,6 @@ def _cleanup_auth_flow_server(state: str):
 @contextmanager
 def _patch_oauthlib_validation():
     """临时放宽 oauthlib 的 token 参数验证（Warning 不再中断），退出时恢复"""
-    import oauthlib.oauth2.rfc6749.parameters
-
     module = oauthlib.oauth2.rfc6749.parameters
     original_validate = module.validate_token_parameters
 
@@ -351,8 +352,6 @@ async def _save_antigravity_credential(
     Returns:
         认证成功的结果字典
     """
-    from .google_oauth_api import get_user_email
-
     # 自动获取邮箱
     email = None
     try:
@@ -677,7 +676,5 @@ def get_auth_status(project_id: str) -> Dict[str, Any]:
 
 async def verify_password(password: str) -> bool:
     """验证密码（面板登录使用）"""
-    from config import get_panel_password
-
     correct_password = await get_panel_password()
     return password == correct_password

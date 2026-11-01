@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import time
+import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Callable, Tuple
@@ -29,6 +30,13 @@ from src.httpx_client import stream_post_async, post_async
 from src.request_pacer import request_pacer
 from src.models import Model, model_to_dict
 from src.utils import ANTIGRAVITY_USER_AGENT
+from src.session_cache import derive_session_key
+from src.usage_log import (
+    extract_usage_tokens,
+    new_request_id,
+    record_usage_log,
+)
+from src.request_body_log import record_request_body
 
 # 导入共同的基础功能
 from src.api.utils import (
@@ -226,8 +234,6 @@ def _derive_session_key(model_name: str, body: Dict[str, Any]) -> Optional[str]:
     body 格式: {"model": ..., "request": <Gemini 规范化请求>}
     hash(模型 + systemInstruction 或 第一条 user 消息) —— 后者必须是经过所有格式处理后的内容
     """
-    from src.session_cache import derive_session_key
-
     inner = body.get("request") if isinstance(body.get("request"), dict) else body
     return derive_session_key(model_name, inner)
 
@@ -243,8 +249,6 @@ def _base_log_entry(
     model_name: 后端实际使用的真实模型名（映射后）
     log_ctx.client_model: 客户端请求的原始模型名（可能带功能前缀）
     """
-    from src.usage_log import new_request_id
-
     ctx = log_ctx or {}
     return {
         "request_id": ctx.get("request_id") or new_request_id(),
@@ -277,8 +281,6 @@ async def _record_request_body_detail(
             return ""
         if status_code not in await get_request_log_error_codes():
             return ""
-
-        from src.request_body_log import record_request_body
 
         rel_path = await record_request_body(
             request_id=str(log_entry.get("request_id", "")),
@@ -337,7 +339,6 @@ async def stream_request(
             "status_code": 500, "success": False,
             "error_message": "当前无可用凭证", "use_time": time.time() - log_start_time,
         })
-        from src.usage_log import record_usage_log
         await record_usage_log(log_entry)
         yield Response(
             content=json.dumps({"error": "当前无可用凭证"}),
@@ -358,7 +359,6 @@ async def stream_request(
             "status_code": 500, "success": False,
             "error_message": "凭证中没有访问令牌", "use_time": time.time() - log_start_time,
         })
-        from src.usage_log import record_usage_log
         await record_usage_log(log_entry)
         yield Response(
             content=json.dumps({"error": "凭证中没有访问令牌"}),
@@ -429,8 +429,6 @@ async def stream_request(
             写入一次上游调用的请求日志（调用一次谷歌 API 产生一条日志；
             重试会在后续 attempt 各自再记一条，属于正常行为）。
             """
-            from src.usage_log import record_usage_log
-
             # 请求体详细日志：命中配置错误码时写盘，数据库只存文件索引
             request_log_file = await _record_request_body_detail(
                 status_code,
@@ -535,8 +533,6 @@ async def stream_request(
                     # 上游最终计数以最后出现的 usageMetadata 为准（last-wins，
                     # 对齐 Antigravity-Manager 的流式 usage 聚合行为）
                     if native is False:
-                        from src.usage_log import extract_usage_tokens
-
                         extracted = extract_usage_tokens(chunk)
                         if extracted:
                             usage_tokens = extracted
@@ -682,8 +678,6 @@ async def non_stream_request(
         写入一次上游调用的请求日志（调用一次谷歌 API 产生一条日志；
         重试会在后续 attempt 各自再记一条，属于正常行为）。
         """
-        from src.usage_log import record_usage_log, extract_usage_tokens
-
         # 请求体详细日志：命中配置错误码时写盘，数据库只存文件索引
         request_log_file = await _record_request_body_detail(
             status_code,
@@ -1048,7 +1042,6 @@ async def fetch_available_models() -> List[Dict[str, Any]]:
             return []
 
     except Exception as e:
-        import traceback
         log.error(f"[ANTIGRAVITY] Failed to fetch models: {e}")
         log.error(f"[ANTIGRAVITY] Traceback: {traceback.format_exc()}")
         return []
@@ -1197,7 +1190,6 @@ async def fetch_quota_info(access_token: str, project_id: str = "") -> Dict[str,
             "source": "retrieveUserQuotaSummary",
         }
     except Exception as e:
-        import traceback
         log.error(f"[ANTIGRAVITY QUOTA] Failed to fetch quota: {e}")
         log.error(f"[ANTIGRAVITY QUOTA] Traceback: {traceback.format_exc()}")
         return {

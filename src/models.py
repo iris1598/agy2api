@@ -4,9 +4,9 @@
 - 面板 API：登录、认证、凭证操作、配置保存模型
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 def model_to_dict(model: BaseModel) -> Dict[str, Any]:
@@ -35,23 +35,51 @@ class OpenAIToolFunction(BaseModel):
     parameters: Optional[Dict[str, Any]] = None
 
 
+class OpenAIToolCallFunction(BaseModel):
+    """An assistant tool call carries arguments, not a tool parameter schema."""
+
+    name: str
+    arguments: Any = ""
+
+
 class OpenAIToolCall(BaseModel):
     id: str
-    type: str = "function"
-    function: OpenAIToolFunction
+    type: Literal["function"] = "function"
+    function: OpenAIToolCallFunction
 
 
 class OpenAITool(BaseModel):
-    type: str = "function"
+    type: Literal["function"] = "function"
     function: OpenAIToolFunction
 
 
 class OpenAIChatMessage(BaseModel):
-    role: str
+    role: Literal["system", "developer", "user", "assistant", "tool"]
     content: Any = None
     name: Optional[str] = None
     tool_calls: Optional[List[OpenAIToolCall]] = None
     tool_call_id: Optional[str] = None
+    refusal: Optional[str] = None
+    audio: Optional[Dict[str, Any]] = None
+    function_call: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def validate_message(self):
+        if self.tool_calls and self.role != "assistant":
+            raise ValueError("only assistant messages may contain tool_calls")
+        if self.role == "assistant" and self.audio is not None:
+            raise ValueError("assistant audio history is unsupported by Antigravity")
+        if self.function_call is not None:
+            raise ValueError("legacy function_call history is unsupported; use tool_calls")
+        if self.role in ("system", "developer") and not isinstance(self.content, str):
+            if not isinstance(self.content, list) or not all(
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+                for part in self.content
+            ):
+                raise ValueError("system and developer messages require text content")
+        return self
 
 
 class OpenAIChatCompletionRequest(BaseModel):

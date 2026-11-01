@@ -8,7 +8,10 @@ import time
 import uuid
 from typing import Any, Dict, Optional
 
+import config
 from log import log
+
+from src.storage.database import get_database
 
 
 def new_request_id() -> str:
@@ -111,12 +114,8 @@ async def record_usage_log(entry: Dict[str, Any]) -> None:
               request_log_file（请求体详细日志的磁盘文件索引，空=未记录）
     """
     try:
-        import config
-
         if not await config.get_usage_log_enabled():
             return
-
-        from src.storage.database import get_database
 
         database = await get_database()
         entry = {**entry, "created_at": entry.get("created_at") or time.time()}
@@ -127,8 +126,6 @@ async def record_usage_log(entry: Dict[str, Any]) -> None:
 
 async def clear_usage_logs(days: int) -> int:
     """清理 N 天前的日志，返回删除条数"""
-    from src.storage.database import get_database
-
     database = await get_database()
     cutoff = time.time() - days * 86400
     return await database.delete_usage_logs_before(cutoff)
