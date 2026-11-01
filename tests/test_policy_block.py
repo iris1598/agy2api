@@ -357,7 +357,7 @@ def _aggregated_normal_response():
 
 
 def _patch_upstream(monkeypatch, mode, resp_body: bytes, status_code: int):
-    """mock API 层的 non_stream_request，返回指定响应体
+    """mock Gemini 路由模块内的 non_stream_request，返回指定响应体
 
     mode 参数保留以兼容调用方，上游删除 geminicli 后仅剩 antigravity 一种。
     """
@@ -369,12 +369,17 @@ def _patch_upstream(monkeypatch, mode, resp_body: bytes, status_code: int):
     async def identity_normalize(request):
         return request
 
+    # 必须 patch 路由模块自己持有的名字，而不是 src.api.antigravity /
+    # src.converter.antigravity_fix 的模块属性：路由模块是顶层
+    # `from ... import ...` 导入，且首次 import 发生在第一个用例内，
+    # patch 源模块对已绑定的名字无效，会导致第一个用例的 fake 泄漏到后续用例。
+    from src.router.antigravity import gemini as antigravity_gemini
+
     monkeypatch.setattr(
-        "src.api.antigravity.non_stream_request", fake_non_stream_request
+        antigravity_gemini, "non_stream_request", fake_non_stream_request
     )
     monkeypatch.setattr(
-        "src.converter.antigravity_fix.normalize_antigravity_request",
-        identity_normalize,
+        antigravity_gemini, "normalize_antigravity_request", identity_normalize
     )
 
 
