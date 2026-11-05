@@ -111,6 +111,7 @@ const CONFIG_GROUPS = [
       { key: "request_jitter", label: "随机抖动上限（秒）", type: "number", showIf: (cfg) => !!cfg.request_throttle_enabled, note: "每次请求额外附加 [0, 上限] 内的随机抖动（默认 2.0）。建议 2~3 秒" },
       { key: "request_serial_enabled", label: "串行模式", type: "bool", showIf: (cfg) => !!cfg.request_throttle_enabled, note: "上一个请求【结束后】再发送下一个（间隔从结束时刻起算），严格排队不重叠，适合 Antigravity CLI 单账号/单会话场景。需同时开启请求节流" },
       { key: "stream_read_timeout", label: "上游流式读超时（秒）", type: "number", note: "上游流式响应相邻两次数据之间的最大空闲时长（默认 300）。超过即报错并释放请求，防止串行回合锁/并发名额被挂起的流永久占用导致死锁。持续有数据时计时不断重置，超长生成不受影响；设为 0 禁用（不建议）" },
+      { key: "request_body_timeout", label: "入站请求体读超时（秒）", type: "number", note: "客户端发送请求体时相邻两次数据之间的最大空闲时长（默认 30）。超过即返回 408 并释放请求，防止客户端在网络波动中迟迟传不完请求体，导致串行回合锁/并发名额被半截请求永久占用而死锁。请求体仍在陆续到达时计时不断重置，大请求不受影响；客户端正常断开不经过此超时；设为 0 禁用（不建议）" },
     ],
   },
   {

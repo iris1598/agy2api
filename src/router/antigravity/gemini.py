@@ -374,6 +374,10 @@ async def count_tokens(
 
     try:
         request_data = await request.json()
+    except HTTPException:
+        # 入站请求体读超时（InboundBodyTimeout，408）等框架异常原样放行，
+        # 不转成 400，否则客户端无法区分「传得慢」和「传错了」
+        raise
     except Exception as e:
         log.error(f"Failed to parse JSON request: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")

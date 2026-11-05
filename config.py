@@ -62,6 +62,7 @@ ENV_MAPPINGS = {
     "REQUEST_JITTER": "request_jitter",
     "REQUEST_SERIAL_ENABLED": "request_serial_enabled",
     "STREAM_READ_TIMEOUT": "stream_read_timeout",
+    "REQUEST_BODY_TIMEOUT": "request_body_timeout",
 }
 
 
@@ -978,4 +979,36 @@ async def get_stream_read_timeout() -> float:
         value = float(await get_config_value("stream_read_timeout", 300.0))
     except (TypeError, ValueError):
         return 300.0
+    return max(0.0, value)
+
+
+async def get_request_body_timeout() -> float:
+    """
+    Get inbound request body chunk read timeout (seconds).
+
+    入站请求体「相邻两次接收之间」的最大空闲时长。超过后中断请求并返回 408，
+    防止客户端在网络波动中迟迟传不完请求体导致：
+    - 串行模式下回合锁永久占用（后续所有请求死锁，只能重启）
+    - 并发名额泄漏（限流开启时逐渐耗尽所有名额）
+
+    与 STREAM_READ_TIMEOUT 相同，这是「块间空闲」超时而不是整个请求的总时长
+    上限：只要请求体还在陆续到达就会不断重置计时，正常的大请求不受影响。
+    客户端断开（FIN/RST 到达服务器）时依旧走正常的断开处理，不依赖本超时。
+    设为 0 可禁用（恢复旧的无限等待行为，不建议）。
+
+    Environment variable: REQUEST_BODY_TIMEOUT
+    Database config key: request_body_timeout
+    Default: 30.0
+    """
+    env_value = os.getenv("REQUEST_BODY_TIMEOUT")
+    if env_value:
+        try:
+            return max(0.0, float(env_value))
+        except ValueError:
+            pass
+
+    try:
+        value = float(await get_config_value("request_body_timeout", 30.0))
+    except (TypeError, ValueError):
+        return 30.0
     return max(0.0, value)

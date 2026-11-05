@@ -291,6 +291,10 @@ async def count_tokens(
     """
     try:
         payload = await request.json()
+    except HTTPException:
+        # 入站请求体读超时（InboundBodyTimeout，408）等框架异常原样放行，
+        # 不吞进下面的通用 400，否则客户端无法区分「传得慢」和「传错了」
+        raise
     except Exception as e:
         return JSONResponse(
             status_code=400,

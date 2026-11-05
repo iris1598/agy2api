@@ -18,9 +18,21 @@ from config import (
     get_rate_limit_max_concurrent,
     get_rate_limit_requests_per_window,
     get_rate_limit_window_seconds,
+    get_request_body_timeout,
 )
 from log import log
 from src.request_pacer import request_pacer
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+
+class InboundBodyTimeout(StarletteHTTPException):
+    """入站请求体读取超时：客户端长时间未发送完整请求体（块间空闲超过上限）。
+
+    继承 HTTPException(408) 而不是裸 Exception：FastAPI 对「声明式请求体解析」
+    阶段的异常有宽泛的 except Exception 兜底（转成 400 "error parsing the
+    body"），但会原样放行 HTTPException，由 ExceptionMiddleware 转成标准 408
+    响应。端点内手动读体（如 count_tokens）时该异常则由本中间件捕获后补发 408。
+    """
 
 
 class RateLimiter:
@@ -146,6 +158,10 @@ class RateLimitMiddleware:
         rate_held = False
         released_turn = False
         released_rate = False
+        # 请求体阶段结束的标志：读完整（more_body=False）、感知到断开、或响应已开始。
+        # 超时保护只覆盖请求体阶段；响应阶段 receive 的语义完全不同（断开探测）。
+        body_phase_done = False
+        response_started = False
 
         def release_turn_once():
             """同步归还回合锁：不包含 await，因此在被取消的清理路径上也一定会执行。"""
@@ -162,12 +178,47 @@ class RateLimitMiddleware:
                 rate_limiter.release_nowait()
 
         async def send_wrapper(message):
+            nonlocal response_started, body_phase_done
+            if message["type"] == "http.response.start":
+                response_started = True
+                # 防御：若端点未读体就直接响应（或后续用 receive 探测断开），
+                # 请求体阶段视为已结束，禁止再触发入站超时
+                body_phase_done = True
             await send(message)
             # 响应体发送完成后释放（包含流式响应的最后一帧）
             if message["type"] == "http.response.body" and not message.get("more_body"):
                 # 先释放并发名额，再释放回合：避免下个排队请求醒来时并发仍满
                 release_rate_once()
                 release_turn_once()
+
+        # 入站请求体分块读超时（默认 30s，0=禁用）：语义等价于 nginx 的
+        # client_body_timeout——只要请求体还在陆续到达就不断重置计时，
+        # 仅在链路停滞时中断，防止串行回合锁/并发名额被半截请求永久占用。
+        body_timeout = await get_request_body_timeout()
+
+        async def receive_with_body_timeout():
+            nonlocal body_phase_done
+            if body_phase_done or body_timeout <= 0:
+                return await receive()
+            try:
+                message = await asyncio.wait_for(receive(), timeout=body_timeout)
+            except asyncio.TimeoutError:
+                log.warning(
+                    f"[RATE_LIMIT] 入站请求体读取超时（{body_timeout}s 无数据到达），"
+                    f"中断请求: {method} {path}"
+                )
+                # HTTPException 子类：声明式 body 解析路径下由 ExceptionMiddleware
+                # 发送 408；其余路径由下方 except 捕获后经 _send_408 发送
+                raise InboundBodyTimeout(
+                    status_code=408,
+                    detail="Request Timeout - 客户端长时间未发送完整请求体，连接已中断",
+                    headers={"connection": "close"},
+                ) from None
+            if message["type"] == "http.disconnect" or (
+                message["type"] == "http.request" and not message.get("more_body", False)
+            ):
+                body_phase_done = True
+            return message
 
         try:
             # 1. 串行模式排队：整个流程都在 try 保护之下，任何异常/取消都不会泄漏回合锁
@@ -179,7 +230,16 @@ class RateLimitMiddleware:
                 return
             rate_held = True
 
-            await self.app(scope, receive, send_wrapper)
+            try:
+                await self.app(scope, receive_with_body_timeout, send_wrapper)
+            except InboundBodyTimeout:
+                # 声明式 body 解析路径下 FastAPI 会放行 HTTPException，由
+                # ExceptionMiddleware 先发 408（响应已开始）；仅当异常未被内层
+                # 处理（如端点手动读体且未吞掉）时才在这里补发 408
+                if not response_started:
+                    await self._send_408(send)
+                else:  # pragma: no cover - 防御路径：响应已开始时不可再发响应头
+                    raise
         finally:
             # 兜底释放：客户端断开、任务被取消或任何未捕获异常都不能让名额/回合锁泄漏。
             # 两个释放动作都是同步的（没有 await 点），因此清理过程不可能被取消打断。
@@ -204,4 +264,23 @@ class RateLimitMiddleware:
             (b"retry-after", str(max(1, rate_limiter._window_seconds)).encode()),
         ]
         await send({"type": "http.response.start", "status": 429, "headers": headers})
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    async def _send_408(self, send):
+        body = json.dumps(
+            {
+                "error": {
+                    "message": "Request Timeout - 客户端长时间未发送完整请求体，连接已中断",
+                    "type": "request_timeout",
+                    "code": 408,
+                }
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        # connection: close：请求体不完整时该连接无法复用，明确告知客户端关闭
+        headers = [
+            (b"content-type", b"application/json"),
+            (b"connection", b"close"),
+        ]
+        await send({"type": "http.response.start", "status": 408, "headers": headers})
         await send({"type": "http.response.body", "body": body, "more_body": False})
