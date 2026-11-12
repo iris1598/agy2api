@@ -6,12 +6,12 @@
 - 限流开启时并发名额泄漏，逐渐耗尽后全部 429；
 - 只能重启进程恢复。
 
-修复：get_streaming_client 在 timeout=None 时启用分阶段超时，
-read 超时来自 STREAM_READ_TIMEOUT（默认 300s，0=禁用），作用于
+修复：stream_post_async 为流式请求传入分阶段超时（共享客户端按请求
+生效），read 超时来自 STREAM_READ_TIMEOUT（默认 300s，0=禁用），作用于
 「相邻两次网络读取之间」的空闲时长。本文件验证：
 
 1. 配置项解析（默认值 / 环境变量 / 禁用值）；
-2. 流式客户端确实带上了分阶段超时；
+2. 流式请求确实带上了分阶段超时；
 3. 真实挂起上游（发一半后沉默）在 read 超时内抛出 httpx.ReadTimeout；
 4. 持续有数据到达时不会误杀（计时不断重置）。
 
@@ -30,7 +30,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import httpx  # noqa: E402
 
 from config import get_stream_read_timeout  # noqa: E402
-from src.httpx_client import get_streaming_client  # noqa: E402
+from src.httpx_client import (  # noqa: E402
+    _get_stream_timeout,
+    close_shared_clients,
+    stream_post_async,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -64,36 +68,32 @@ def test_stream_read_timeout_zero_disables() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. 流式客户端带上分阶段超时
+# 2. 流式请求带上分阶段超时
 # ---------------------------------------------------------------------------
-def test_streaming_client_gets_phased_timeout() -> None:
-    """get_streaming_client(timeout=None) 应构造 httpx.Timeout 且 read 来自配置"""
+def test_streaming_timeout_gets_phased_timeout() -> None:
+    """stream_post_async 使用的超时：read 来自配置，其余固定 30s"""
 
     async def run():
         os.environ["STREAM_READ_TIMEOUT"] = "120"
         try:
-            async with get_streaming_client() as client:
-                t = client.timeout
-                assert isinstance(t, httpx.Timeout), f"应为 httpx.Timeout，实际 {type(t)}"
-                assert t.connect == 30.0, f"connect 应为 30，实际 {t.connect}"
-                assert t.read == 120.0, f"read 应为 120，实际 {t.read}"
+            t = await _get_stream_timeout()
+            assert isinstance(t, httpx.Timeout), f"应为 httpx.Timeout，实际 {type(t)}"
+            assert t.connect == 30.0, f"connect 应为 30，实际 {t.connect}"
+            assert t.read == 120.0, f"read 应为 120，实际 {t.read}"
         finally:
             os.environ.pop("STREAM_READ_TIMEOUT", None)
 
     asyncio.run(run())
 
 
-def test_streaming_client_disabled_when_config_zero() -> None:
-    """配置为 0 时保持无超时（旧行为）。httpx 会把 timeout=None
-    归一化为 Timeout(timeout=None)，因此检查 read 为 None。"""
+def test_streaming_timeout_disabled_when_config_zero() -> None:
+    """配置为 0 时保持无超时（旧行为），返回 None。"""
 
     async def run():
         os.environ["STREAM_READ_TIMEOUT"] = "0"
         try:
-            async with get_streaming_client() as client:
-                t = client.timeout
-                read = getattr(t, "read", None)
-                assert read is None, f"禁用时 read 超时应为 None，实际 {t}"
+            t = await _get_stream_timeout()
+            assert t is None, f"禁用时应返回 None，实际 {t}"
         finally:
             os.environ.pop("STREAM_READ_TIMEOUT", None)
 
@@ -135,26 +135,25 @@ async def _start_hanging_server():
 
 async def _case_hanging_upstream_times_out() -> None:
     server, port, writers = await _start_hanging_server()
+    started = 0.0
+    received = []
     try:
         os.environ["STREAM_READ_TIMEOUT"] = "1"
-        async with get_streaming_client() as client:
-            started = time.monotonic()
-            received = []
-            async with client.stream(
-                "POST", f"http://127.0.0.1:{port}/v1:stream", json={}
-            ) as r:
-                assert r.status_code == 200
-                async for line in r.aiter_lines():
-                    received.append(line)
-                    # 收到部分数据后上游沉默
-            # 不应走到这里
-            raise AssertionError("上游挂起时应抛出 ReadTimeout，而不是正常结束")
+        started = time.monotonic()
+        async for line in stream_post_async(
+            f"http://127.0.0.1:{port}/v1:stream", body={}
+        ):
+            received.append(line)
+            # 收到部分数据后上游沉默
+        # 不应走到这里
+        raise AssertionError("上游挂起时应抛出 ReadTimeout，而不是正常结束")
     except httpx.ReadTimeout:
         elapsed = time.monotonic() - started
         assert elapsed < 5.0, f"ReadTimeout 应在 read 超时（1s）附近抛出，实际 {elapsed:.1f}s"
         assert len(received) >= 2, "应已收到部分数据后才超时（模拟流中途卡死）"
     finally:
         os.environ.pop("STREAM_READ_TIMEOUT", None)
+        await close_shared_clients()
         # 注意：不能用 wait_closed()——Python 3.12+ 会等所有 handler 结束，
         # 而挂起 handler 永远不结束。直接强关连接再关服务器。
         for w in writers:
@@ -206,18 +205,17 @@ async def _case_trickling_stream_not_killed() -> None:
     server, port = await _start_trickling_server()
     try:
         os.environ["STREAM_READ_TIMEOUT"] = "0.5"  # 块间空闲上限 0.5s
-        async with get_streaming_client() as client:
-            lines = []
-            async with client.stream(
-                "POST", f"http://127.0.0.1:{port}/v1:stream", json={}
-            ) as r:
-                async for line in r.aiter_lines():
-                    lines.append(line)
+        lines = []
+        async for line in stream_post_async(
+            f"http://127.0.0.1:{port}/v1:stream", body={}
+        ):
+            lines.append(line)
         assert any("chunk-9" in line for line in lines), (
             f"慢速但持续的数据流不应被 read 超时误杀，收到: {lines}"
         )
     finally:
         os.environ.pop("STREAM_READ_TIMEOUT", None)
+        await close_shared_clients()
         server.close()
 
 

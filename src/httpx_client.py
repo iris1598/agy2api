@@ -3,50 +3,118 @@
 为所有需要使用httpx的模块提供统一的客户端配置和方法
 保持通用性，不与特定业务逻辑耦合
 
-无状态函数风格：无全局实例，每次调用独立构建/销毁客户端
+- 共享 AsyncClient（按代理配置指纹缓存），复用 TCP/TLS 连接，
+  避免每请求新建客户端造成的握手开销
+- 代理配置变化（面板热更新）时指纹变化，旧客户端惰性关闭重建
+- 超时等请求级参数在每次请求时传入，不受客户端实例缓存影响
 """
 
-import json
+import asyncio
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import httpx
+import json
 from fastapi import Response
 
 from config import get_proxy_config, get_stream_read_timeout
 from log import log
 
+# ====================== 共享客户端 ======================
 
-async def get_client_kwargs(timeout: float = 30.0, **kwargs) -> Dict[str, Any]:
-    """获取httpx客户端的通用配置参数"""
-    client_kwargs = {"timeout": timeout, **kwargs}
+# (代理指纹, AsyncClient) 列表；正常情况下最多两个条目（无代理/有代理）
+_shared_clients: List[Tuple[str, httpx.AsyncClient]] = []
+_shared_clients_lock = asyncio.Lock()
 
-    # 动态读取代理配置，支持热更新
-    current_proxy_config = await get_proxy_config()
-    if current_proxy_config:
-        client_kwargs["proxy"] = current_proxy_config
 
-    return client_kwargs
+def _client_fingerprint(proxy_url: Optional[str]) -> str:
+    """客户端指纹：代理 URL 不同则不能复用同一客户端"""
+    return proxy_url or ""
 
+
+async def _build_client(proxy_url: Optional[str]) -> httpx.AsyncClient:
+    """按当前代理配置构建客户端"""
+    client_kwargs: Dict[str, Any] = {"timeout": None}
+    if proxy_url:
+        client_kwargs["proxy"] = proxy_url
+    return httpx.AsyncClient(**client_kwargs)
+
+
+async def _safe_aclose(client: httpx.AsyncClient) -> None:
+    """安全关闭客户端，异常仅告警"""
+    try:
+        await client.aclose()
+    except Exception as e:
+        log.warning(f"关闭旧 httpx 客户端失败: {e}")
+
+
+async def _get_shared_client(**kwargs) -> httpx.AsyncClient:
+    """
+    获取共享的 AsyncClient（按代理指纹缓存复用）。
+
+    调用方不得关闭该客户端（由模块统一管理生命周期，
+    web.py 应用关闭时调用 close_shared_clients）。
+    """
+    proxy_url = await get_proxy_config()
+    fingerprint = _client_fingerprint(proxy_url)
+
+    # 快路径：指纹匹配直接复用（无锁读）
+    for fp, client in _shared_clients:
+        if fp == fingerprint:
+            return client
+
+    # 慢路径：创建或重建客户端
+    async with _shared_clients_lock:
+        # 双重检查（并发下可能已被其他请求创建）
+        for fp, client in _shared_clients:
+            if fp == fingerprint:
+                return client
+
+        # 代理热更新：指纹不匹配的旧客户端移出并异步关闭
+        stale: List[httpx.AsyncClient] = []
+        kept: List[Tuple[str, httpx.AsyncClient]] = []
+        for fp, client in _shared_clients:
+            if fp == fingerprint:
+                kept.append((fp, client))
+            else:
+                stale.append(client)
+        _shared_clients[:] = kept
+
+        new_client = await _build_client(proxy_url)
+        _shared_clients.append((fingerprint, new_client))
+
+        # 惰性关闭旧客户端，不阻塞当前请求
+        for old in stale:
+            try:
+                asyncio.create_task(_safe_aclose(old))
+            except Exception as e:
+                log.warning(f"调度旧客户端关闭失败: {e}")
+
+        return new_client
+
+
+async def close_shared_clients() -> None:
+    """关闭所有共享客户端（应用关闭时调用）"""
+    async with _shared_clients_lock:
+        clients = [c for _, c in _shared_clients]
+        _shared_clients.clear()
+    for client in clients:
+        await _safe_aclose(client)
+
+
+# ====================== 客户端获取（兼容旧接口） ======================
 
 @asynccontextmanager
 async def get_client(
     timeout: float = 30.0, **kwargs
 ) -> AsyncGenerator[httpx.AsyncClient, None]:
-    """获取配置好的异步HTTP客户端"""
-    client_kwargs = await get_client_kwargs(timeout=timeout, **kwargs)
-
-    async with httpx.AsyncClient(**client_kwargs) as client:
-        yield client
+    """获取配置好的异步HTTP客户端（共享复用）"""
+    yield await _get_shared_client()
 
 
-@asynccontextmanager
-async def get_streaming_client(
-    timeout: float = None, **kwargs
-) -> AsyncGenerator[httpx.AsyncClient, None]:
-    """获取用于流式请求的HTTP客户端。
+async def _get_stream_timeout() -> Optional[httpx.Timeout]:
+    """构建流式请求的分阶段超时（防上游挂起死锁）。
 
-    timeout=None 时启用分阶段超时（防上游挂起）：
     - read 超时来自配置 STREAM_READ_TIMEOUT（默认 300s，0=禁用），
       作用于「相邻两次网络读取之间」的空闲时长。上游流中途卡死
       （连接保持但不再发数据）超过该时长即抛出 httpx.ReadTimeout，
@@ -55,40 +123,35 @@ async def get_streaming_client(
     只要上游持续有数据到达，read 计时就会不断重置，
     正常的超长流式生成不受影响。
 
-    显式传入 timeout 时沿用调用方指定的值（兼容旧行为）。
+    read_timeout <= 0：用户显式禁用，返回 None（无限等待）。
     """
-    if timeout is None:
-        read_timeout = await get_stream_read_timeout()
-        if read_timeout > 0:
-            timeout = httpx.Timeout(
-                connect=30.0,
-                read=read_timeout,
-                write=30.0,
-                pool=30.0,
-            )
-        # read_timeout <= 0：用户显式禁用，保持 timeout=None（无限等待）
-
-    client_kwargs = await get_client_kwargs(timeout=timeout, **kwargs)
-
-    # 创建独立的客户端实例用于流式处理
-    client = httpx.AsyncClient(**client_kwargs)
-    try:
-        yield client
-    finally:
-        # 确保无论发生什么都关闭客户端
-        try:
-            await client.aclose()
-        except Exception as e:
-            log.warning(f"Error closing streaming client: {e}")
+    read_timeout = await get_stream_read_timeout()
+    if read_timeout <= 0:
+        return None
+    return httpx.Timeout(
+        connect=30.0,
+        read=read_timeout,
+        write=30.0,
+        pool=30.0,
+    )
 
 
-# 通用的异步方法
+@asynccontextmanager
+async def get_streaming_client(
+    timeout: float = None, **kwargs
+) -> AsyncGenerator[httpx.AsyncClient, None]:
+    """获取用于流式请求的HTTP客户端（共享复用）"""
+    yield await _get_shared_client()
+
+
+# ====================== 异步请求方法 ======================
+
 async def get_async(
     url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 30.0, **kwargs
 ) -> httpx.Response:
     """通用异步GET请求"""
-    async with get_client(timeout=timeout, **kwargs) as client:
-        return await client.get(url, headers=headers)
+    client = await _get_shared_client()
+    return await client.get(url, headers=headers, timeout=timeout, **kwargs)
 
 
 async def post_async(
@@ -100,8 +163,10 @@ async def post_async(
     **kwargs,
 ) -> httpx.Response:
     """通用异步POST请求"""
-    async with get_client(timeout=timeout, **kwargs) as client:
-        return await client.post(url, data=data, json=json, headers=headers)
+    client = await _get_shared_client()
+    return await client.post(
+        url, data=data, json=json, headers=headers, timeout=timeout, **kwargs
+    )
 
 
 # 调试用：设为 True 时所有流式请求都返回 429
@@ -123,18 +188,27 @@ async def stream_post_async(
         )
         return
 
-    async with get_streaming_client(**kwargs) as client:
-        async with client.stream("POST", url, json=body, headers=headers) as r:
-            # 错误直接返回
-            if r.status_code != 200:
-                yield Response(await r.aread(), r.status_code, dict(r.headers))
-                return
+    client = await _get_shared_client()
 
-            # 如果native=True，直接返回bytes流
-            if native:
-                async for chunk in r.aiter_bytes():
-                    yield chunk
-            else:
-                # 通过aiter_lines转化成str流返回
-                async for line in r.aiter_lines():
-                    yield line
+    # 流式请求默认启用分阶段超时（防上游挂起导致回合锁/并发名额永久占用）；
+    # 调用方显式传入 timeout 时以调用方为准。
+    if "timeout" not in kwargs:
+        kwargs["timeout"] = await _get_stream_timeout()
+
+    async with client.stream(
+        "POST", url, json=body, headers=headers, **kwargs
+    ) as r:
+        # 错误直接返回
+        if r.status_code != 200:
+            yield Response(await r.aread(), r.status_code, dict(r.headers))
+            return
+
+        # 如果native=True，直接返回bytes流
+        if native:
+            async for chunk in r.aiter_bytes():
+                yield chunk
+        else:
+            # 通过aiter_lines转化成str流返回
+            async for line in r.aiter_lines():
+                yield line
+

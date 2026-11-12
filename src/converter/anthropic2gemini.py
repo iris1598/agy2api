@@ -353,24 +353,27 @@ def clean_json_schema(schema: Any) -> Any:
     if "properties" in cleaned and "type" not in cleaned:
         cleaned["type"] = "object"
 
+    # required 与 nullable 正交：null 也是合法取值，nullable 不等于可选。
+    # 保留原始接口契约中的 required 约束，避免上游把必填参数当作可选，
+    # 进而在工具调用时生成空参数 {}。
     if (
         isinstance(schema.get("properties"), dict)
         and isinstance(cleaned.get("required"), list)
     ):
-        nullable_fields = {
-            name
-            for name, prop in schema["properties"].items()
-            if isinstance(prop, dict)
-            and isinstance(prop.get("type"), list)
-            and any(str(t).lower() == "null" for t in prop["type"])
-        }
-        if nullable_fields:
-            cleaned["required"] = [
-                item for item in cleaned["required"]
-                if item not in nullable_fields
-            ]
-            if not cleaned["required"]:
-                cleaned.pop("required", None)
+        prop_names = set(cleaned.get("properties", {}).keys()) \
+            if isinstance(cleaned.get("properties"), dict) else None
+        required = []
+        for item in cleaned["required"]:
+            if not isinstance(item, str):
+                continue
+            if prop_names is not None and item not in prop_names:
+                continue
+            if item not in required:
+                required.append(item)
+        if required:
+            cleaned["required"] = required
+        else:
+            cleaned.pop("required", None)
 
     return cleaned
 
@@ -1031,9 +1034,6 @@ async def gemini_stream_to_anthropic_stream(
                 yield error_content
                 return
 
-            # 记录接收到的原始chunk
-            log.debug(f"[GEMINI_TO_ANTHROPIC] Raw chunk: {chunk[:200] if chunk else b''}")
-
             # finishReason 之后的残余块只消费不转换：
             # 提前 break 会沿生成器链下发 GeneratorExit，导致底层
             # stream_request 的成功日志记录代码永远不执行（issue #438）
@@ -1042,22 +1042,17 @@ async def gemini_stream_to_anthropic_stream(
 
             # 解析 Gemini 流式块
             if not chunk or not chunk.startswith(b"data: "):
-                log.debug(f"[GEMINI_TO_ANTHROPIC] Skipping chunk (not SSE format or empty)")
                 continue
 
             raw = chunk[6:].strip()
             if raw == b"[DONE]":
-                log.debug(f"[GEMINI_TO_ANTHROPIC] Received [DONE] marker")
                 # 同 finishReason：不 break，改为消费剩余块直到流自然结束，
                 # 避免向底层 stream_request 下发 GeneratorExit 导致日志丢失
                 stream_finished = True
                 continue
 
-            log.debug(f"[GEMINI_TO_ANTHROPIC] Parsing JSON: {raw[:200]}")
-
             try:
                 data = json.loads(raw.decode('utf-8', errors='ignore'))
-                log.debug(f"[GEMINI_TO_ANTHROPIC] Parsed data: {json.dumps(data, ensure_ascii=False)[:300]}")
             except Exception as e:
                 log.warning(f"[GEMINI_TO_ANTHROPIC] JSON parse error: {e}")
                 continue
