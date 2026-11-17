@@ -176,7 +176,7 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
                 if not word:
                     continue
                 try:
-                    re.compile(re.escape(word), re.IGNORECASE | re.UNICODE)
+                    re.compile(re.escape(word), re.UNICODE)
                 except re.error:
                     raise HTTPException(status_code=400, detail=f"无效的敏感词: {word!r}")
                 cleaned_words.append(word)

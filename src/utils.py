@@ -1,7 +1,5 @@
 from typing import Optional
 
-import httpx
-
 from config import get_api_password, get_panel_password
 from fastapi import Depends, HTTPException, Header, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -12,45 +10,24 @@ security = HTTPBearer()
 
 # ====================== OAuth Configuration ======================
 
-# Antigravity CLI 客户端仿真常量
-_DEFAULT_ANTIGRAVITY_CLI_VERSION = "1.5.3"
-_LATEST_RELEASE_URL = (
-    "https://api.github.com/repos/google-antigravity/antigravity-cli/releases/latest"
+# Antigravity 官方语言服务枢纽 (Antigravity Hub) 指纹常量
+# 出站 User-Agent 对齐官方 Hub 签名（版本号与 CL 为 Google Piper 内部构建点，
+# 必须成对出现、全球正版客户端统一，切勿随机变动）：
+#   antigravity/hub/{OFFICIAL_HUB_VERSION} (aidev_client; os_type=windows; arch=amd64; cl={OFFICIAL_HUB_CL})
+OFFICIAL_HUB_VERSION = "2.28.0"
+OFFICIAL_HUB_CL = "1008300195"
+_HUB_FINGERPRINT_OS = "windows"
+_HUB_FINGERPRINT_ARCH = "amd64"
+
+ANTIGRAVITY_USER_AGENT = (
+    f"antigravity/hub/{OFFICIAL_HUB_VERSION} "
+    f"(aidev_client; os_type={_HUB_FINGERPRINT_OS}; "
+    f"arch={_HUB_FINGERPRINT_ARCH}; cl={OFFICIAL_HUB_CL})"
 )
-
-
-def _get_latest_antigravity_cli_version() -> str:
-    """获取最新 Antigravity CLI 版本；获取失败时返回默认版本。"""
-    try:
-        response = httpx.get(
-            _LATEST_RELEASE_URL,
-            headers={"Accept": "application/vnd.github+json"},
-            timeout=10.0,
-        )
-        response.raise_for_status()
-        release_data = response.json()
-    except (httpx.HTTPError, ValueError) as error:
-        log.warning(
-            "获取最新 Antigravity CLI 版本失败，使用默认版本 "
-            f"{_DEFAULT_ANTIGRAVITY_CLI_VERSION}: {error}"
-        )
-        return _DEFAULT_ANTIGRAVITY_CLI_VERSION
-
-    tag_name = release_data.get("tag_name") if isinstance(release_data, dict) else None
-    if not isinstance(tag_name, str) or not tag_name.strip():
-        log.warning(
-            "GitHub API 响应中没有有效的 tag_name，使用默认版本 "
-            f"{_DEFAULT_ANTIGRAVITY_CLI_VERSION}"
-        )
-        return _DEFAULT_ANTIGRAVITY_CLI_VERSION
-
-    return tag_name.strip().lstrip("vV")
-
-
-ANTIGRAVITY_CLI_VERSION = _get_latest_antigravity_cli_version()
-ANTIGRAVITY_CLI_PLATFORM = "windows/amd64"
-ANTIGRAVITY_USER_AGENT = f"antigravity/cli/{ANTIGRAVITY_CLI_VERSION} {ANTIGRAVITY_CLI_PLATFORM}"
-log.info(f"当前 Antigravity CLI 版本: {ANTIGRAVITY_CLI_VERSION}")
+# 兼容旧引用
+ANTIGRAVITY_CLI_VERSION = OFFICIAL_HUB_VERSION
+ANTIGRAVITY_CLI_PLATFORM = f"{_HUB_FINGERPRINT_OS}/{_HUB_FINGERPRINT_ARCH}"
+log.info(f"当前 Antigravity Hub 出站指纹: {ANTIGRAVITY_USER_AGENT}")
 
 # Antigravity OAuth Configuration
 ANTIGRAVITY_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"

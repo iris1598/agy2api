@@ -50,8 +50,11 @@ DEFAULT_SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_JAILBREAK", "threshold": "OFF"},
 ]
 
-MAX_OUTPUT_TOKENS = 64000
-TOP_K = 64
+# 官方模型目录权威 maxOutputTokens：Claude 严禁超 64k；Gemini 家族 65536
+CLAUDE_MAX_OUTPUT_TOKENS = 64000
+GEMINI_MAX_OUTPUT_TOKENS = 65536
+# Anthropic 规范: Claude thinkingBudget 下限 1024
+CLAUDE_MIN_THINKING_BUDGET = 1024
 _CLAUDE_THINKING_SIGNATURE = "skip_thought_signature_validator"  # 官方文档推荐的虚拟签名
 
 
@@ -676,7 +679,7 @@ async def _get_sensitive_word_patterns():
 
 
 def _filter_text(text: str, patterns) -> str:
-    """对文本应用敏感词过滤（大小写不敏感，命中替换为空）"""
+    """对文本应用敏感词过滤（大小写敏感，命中替换为空）"""
     return apply_sensitive_word_filter(text, patterns)
 
 
@@ -833,6 +836,170 @@ def _prepare_claude_history(contents: List[Any], generation_config: Dict[str, An
     return contents
 
 
+# ==================== 官方报文结构规范化 ====================
+
+def _split_tools_single_function(tools: Any) -> Any:
+    """将 tools 拆解为官方单函数独立切片形态，保持客户端声明顺序。
+
+    官方 HAR 抓包铁律：原生 329 次带工具报文中，独立切片占比 100%：
+        "tools": [
+            { "functionDeclarations": [ { "name": "tool1", ... } ] },
+            { "functionDeclarations": [ { "name": "tool2", ... } ] }
+        ]
+    - 每个对象仅包含一个 functionDeclarations，且其中只有一个声明；
+    - 参数 schema 的 type 字段统一转大写（官方全工具采用 OBJECT/STRING/INTEGER/BOOLEAN/ARRAY）；
+    - 非 functionDeclarations 工具（googleSearch / codeExecution 等）严格保持就地位置。
+    """
+    if not isinstance(tools, list):
+        return tools
+
+    expanded_tools: List[Any] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            expanded_tools.append(tool)
+            continue
+
+        declarations = tool.get("functionDeclarations") or tool.get("function_declarations")
+        if isinstance(declarations, list):
+            for declaration in declarations:
+                if isinstance(declaration, dict):
+                    decl_copy = dict(declaration)
+                    parameters = decl_copy.get("parameters")
+                    if isinstance(parameters, (dict, list)):
+                        _enforce_uppercase_schema_types(parameters)
+                    expanded_tools.append({"functionDeclarations": [decl_copy]})
+                else:
+                    expanded_tools.append({"functionDeclarations": [declaration]})
+            continue
+
+        # 非 functionDeclarations 工具（googleSearch / codeExecution）严格保持就地位置
+        expanded_tools.append(tool)
+
+    return expanded_tools
+
+
+def _canonicalize_system_instruction(system_instruction: Dict[str, Any]) -> Dict[str, Any]:
+    """规范化 systemInstruction 为官方形态 {role: "user", parts: [...]}，统一键序 role -> parts -> 其余。
+
+    官方报文 systemInstruction 恒为:
+        { "role": "user", "parts": [ { "text": ... }, ... ] }
+    """
+    if not isinstance(system_instruction, dict):
+        return system_instruction
+
+    canonical: Dict[str, Any] = {}
+    role = system_instruction.get("role")
+    if not isinstance(role, str) or not role:
+        role = "user"
+    canonical["role"] = role
+    if "parts" in system_instruction:
+        canonical["parts"] = system_instruction["parts"]
+    for key, value in system_instruction.items():
+        if key not in ("role", "parts"):
+            canonical[key] = value
+    return canonical
+
+
+def _enforce_uppercase_schema_types(schema: Any) -> None:
+    """递归将 schema 的 type 字段值转为大写（官方 HAR 全工具采用大写类型标记 OBJECT/STRING/...）。
+
+    注意：仅转换 type 键的值，其他字段（如 enum 值、format）保持原样。
+    """
+    if isinstance(schema, dict):
+        type_value = schema.get("type")
+        if isinstance(type_value, str):
+            schema["type"] = type_value.upper()
+        for key in ("properties",):
+            if isinstance(schema.get(key), dict):
+                for prop_schema in schema[key].values():
+                    _enforce_uppercase_schema_types(prop_schema)
+        if isinstance(schema.get("items"), (dict, list)):
+            _enforce_uppercase_schema_types(schema["items"])
+    elif isinstance(schema, list):
+        for item in schema:
+            _enforce_uppercase_schema_types(item)
+
+
+def _normalize_generation_config(
+    result: Dict[str, Any],
+    generation_config: Dict[str, Any],
+    profile: "ModelProfile",
+    upstream: str,
+) -> Dict[str, Any]:
+    """thinkingConfig / generationConfig 归一（对齐官方拓扑）。
+
+    - 吸收 request 根节点的 thinkingConfig / thinking_config 到
+      generationConfig.thinkingConfig（官方报文 thinkingConfig 只存在于 generationConfig 内）；
+    - Claude + 强制工具调用（toolConfig mode=ANY）时剔除 thinkingConfig，
+      杜绝 Anthropic "Thinking may not be enabled when tool_choice forces tool use" 400；
+    - Claude thinkingBudget 下限保护（Anthropic 规范 >= 1024）；
+    - 不伪造 topK / topP（官方报文不携带，保留客户端显式值）。
+    """
+    root_tc = result.pop("thinkingConfig", None)
+    if root_tc is None:
+        root_tc = result.pop("thinking_config", None)
+    if root_tc is not None and "thinkingConfig" not in generation_config:
+        if isinstance(root_tc, dict):
+            # thinking_budget snake_case 归一为 thinkingBudget
+            if "thinkingBudget" not in root_tc and "thinking_budget" in root_tc:
+                root_tc["thinkingBudget"] = root_tc.pop("thinking_budget")
+        generation_config["thinkingConfig"] = root_tc
+
+    is_claude = profile.family == "claude"
+
+    if is_claude:
+        tool_config = result.get("toolConfig")
+        forced_tool_choice = (
+            isinstance(tool_config, dict)
+            and str(
+                (tool_config.get("functionCallingConfig") or {}).get("mode", "")
+            ).upper() == "ANY"
+        )
+        if forced_tool_choice:
+            if generation_config.pop("thinkingConfig", None) is not None:
+                print(
+                    "[ANTIGRAVITY] Claude 目标带强制工具调用 (mode=ANY)，剔除 thinkingConfig "
+                    "防止上游 400 (thinking 与 tool_choice 冲突)",
+                    flush=True,
+                )
+
+        thinking_config = generation_config.get("thinkingConfig")
+        if isinstance(thinking_config, dict):
+            budget = thinking_config.get("thinkingBudget")
+            if isinstance(budget, int) and not isinstance(budget, bool) and 0 < budget < CLAUDE_MIN_THINKING_BUDGET:
+                print(
+                    f"[ANTIGRAVITY] Claude thinkingBudget {budget} 低于 Anthropic 规范下限，"
+                    f"钳制为 {CLAUDE_MIN_THINKING_BUDGET}",
+                    flush=True,
+                )
+                thinking_config["thinkingBudget"] = CLAUDE_MIN_THINKING_BUDGET
+
+    # 官方标配 maxOutputTokens（在 thinkingConfig 剔除/钳制之后补齐）：
+    # Claude 64000（严禁超 64k），Gemini 家族 65536
+    is_claude_model = is_claude or "claude" in (upstream or "").lower()
+    default_max_output = CLAUDE_MAX_OUTPUT_TOKENS if is_claude_model else GEMINI_MAX_OUTPUT_TOKENS
+    if generation_config.get("maxOutputTokens") in (None, 65536, 64000):
+        generation_config["maxOutputTokens"] = default_max_output
+
+    # generationConfig 内部键序: candidateCount -> maxOutputTokens -> thinkingConfig -> temperature -> topP -> topK -> 其余
+    ordered_keys = [
+        "candidateCount",
+        "maxOutputTokens",
+        "thinkingConfig",
+        "temperature",
+        "topP",
+        "topK",
+    ]
+    reordered: Dict[str, Any] = {}
+    for key in ordered_keys:
+        if key in generation_config:
+            reordered[key] = generation_config.pop(key)
+    for key, value in generation_config.items():
+        if key not in reordered:
+            reordered[key] = value
+    return reordered
+
+
 # ==================== 统一的 Antigravity 请求后处理 ====================
 
 async def normalize_antigravity_request(
@@ -875,7 +1042,7 @@ async def normalize_antigravity_request(
     profile = resolve_profile(model)
 
     # ========== 0. 敏感词过滤 ==========
-    # 在所有内容处理之前应用：命中面板配置的敏感词（大小写不敏感）直接替换为空，
+    # 在所有内容处理之前应用：命中面板配置的敏感词（大小写敏感）直接替换为空，
     # 避免触发 Google API 端点的敏感词拦截
     sensitive_patterns = await _get_sensitive_word_patterns()
     if sensitive_patterns:
@@ -914,22 +1081,38 @@ async def normalize_antigravity_request(
 
         result["contents"] = _ensure_tool_call_ids(contents, upstream)
 
-    # ========== 3. 工具 ==========
+    # ========== 3. 工具 (单函数独立包装形态) ==========
     if "tools" in result:
         tools = _normalize_tools_for_internal_api(result.get("tools"))
         # Claude: functionDeclarations + parameters；Gemini: 只保留 parameters，避免与 parametersJsonSchema 冲突
-        result["tools"] = _ensure_empty_tool_schema_for_claude(tools, upstream)
+        tools = _ensure_empty_tool_schema_for_claude(tools, upstream)
+        # 拆解为官方单函数独立切片 [{"functionDeclarations": [single_decl]}]，保持客户端声明原序
+        result["tools"] = _split_tools_single_function(tools)
+
+    # ========== 4. systemInstruction 规范化 ==========
+    if not isinstance(result.get("systemInstruction"), dict) and isinstance(result.get("system_instruction"), dict):
+        # snake_case 键归一化为官方 camelCase
+        result["systemInstruction"] = result.pop("system_instruction")
+    if isinstance(result.get("systemInstruction"), dict):
+        result["systemInstruction"] = _canonicalize_system_instruction(result["systemInstruction"])
+    # 双写时 camelCase 优先，清除残留的 snake_case 键
+    result.pop("system_instruction", None)
+
+    # ========== 5. thinkingConfig / generationConfig 归一 ==========
+    generation_config = _normalize_generation_config(result, generation_config, profile, upstream)
 
     # ========== 公共处理 ==========
+    result.pop("thinkingConfig", None)
+    result.pop("thinking_config", None)
     generation_config.pop("presencePenalty", None)
     generation_config.pop("frequencyPenalty", None)
     generation_config.pop("stopSequences", None)
 
     result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
 
+    # 显式覆盖（result 与入参共享 generationConfig 引用，必须切断）
+    result.pop("generationConfig", None)
     if generation_config:
-        generation_config["maxOutputTokens"] = MAX_OUTPUT_TOKENS
-        generation_config["topK"] = TOP_K
         result["generationConfig"] = generation_config
 
     return result

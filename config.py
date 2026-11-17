@@ -353,7 +353,7 @@ async def get_sensitive_words() -> list:
 
 def compile_sensitive_words(words: list):
     """
-    编译敏感词为大小写不敏感的正则列表（带缓存）。
+    编译敏感词为大小写敏感的正则列表（带缓存）。
 
     每个词按字面量转义后编译（用户输入的是词/短语而非正则语法），
     触发后整词替换为空。支持中文（re.UNICODE 默认开启）。
@@ -371,7 +371,7 @@ def compile_sensitive_words(words: list):
         if not word:
             continue
         try:
-            patterns.append(re.compile(re.escape(word), re.IGNORECASE | re.UNICODE))
+            patterns.append(re.compile(re.escape(word), re.UNICODE))
         except re.error as e:
             log.warning(f"敏感词编译失败，已跳过: {word!r} ({e})")
 
@@ -381,7 +381,7 @@ def compile_sensitive_words(words: list):
 
 
 def apply_sensitive_word_filter(text: str, patterns) -> str:
-    """将文本中命中的敏感词（大小写不敏感）替换为空"""
+    """将文本中命中的敏感词（大小写敏感）替换为空"""
     if not text or not patterns:
         return text
     for pattern in patterns:

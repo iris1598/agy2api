@@ -1,4 +1,4 @@
-full_hash=e63b3301617ab2375df292047ec2da14094b8704
-short_hash=e63b330
-message=image 模型独立 CD 键，优先级排在 gemini 之前
-date=2026-11-12 11:32:56 +0800
+full_hash=ca34911693513dabe78527c2caea0ae654723ee9
+short_hash=ca34911
+message=对齐官方 Antigravity Hub 出站报文结构与指纹
+date=2026-11-16 23:16:57 +0800
