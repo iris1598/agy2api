@@ -137,7 +137,7 @@ elif [ -f "./agy2api/web.py" ]; then
     cd ./agy2api
 else
     echo "克隆项目仓库..."
-    git clone https://github.com/iris1598/gcli2api.git
+    git clone https://github.com/iris1598/agy2api.git agy2api
     cd ./agy2api
 fi
 

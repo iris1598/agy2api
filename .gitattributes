@@ -1,0 +1,14 @@
+* text=auto
+
+# Shell / Python / frontend sources must stay LF: CRLF breaks shebangs and
+# heredocs when these files are executed on Linux servers.
+*.sh   text eol=lf
+*.ps1  text eol=crlf
+*.py   text eol=lf
+*.toml text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.js   text eol=lf
+*.jsx  text eol=lf
+*.css  text eol=lf
+*.json text eol=lf

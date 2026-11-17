@@ -24,7 +24,7 @@ elseif (Test-Path -LiteralPath "./agy2api/web.py") {
     Set-Location ./agy2api
 }
 else {
-    git clone https://github.com/iris1598/gcli2api.git
+    git clone https://github.com/iris1598/agy2api.git agy2api
     Set-Location ./agy2api
 }
 # Create relocatable virtual environment to ensure portability
