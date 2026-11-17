@@ -470,6 +470,8 @@ async def stream_request(
     log_entry["credential_email"] = current_file
     access_token = credential_data.get("access_token") or credential_data.get("token")
     project_id = credential_data.get("project_id", "")
+    # 每账号独立出口：该账号配置了代理则走自己的出口，否则沿用全局 PROXY
+    cred_proxy = credential_data.get("proxy") or None
 
     if not access_token:
         log.error(f"[ANTIGRAVITY STREAM] No access token in credential: {current_file}")
@@ -508,7 +510,7 @@ async def stream_request(
 
     # 内部函数：快速更新凭证(只更新token和project_id,避免重建整个请求)
     async def refresh_credential_fast(strict_exclude: bool = False):
-        nonlocal current_file, access_token, auth_headers, project_id, final_payload
+        nonlocal current_file, access_token, auth_headers, project_id, final_payload, cred_proxy
         cred_result = await get_valid_credential(
             model_name=model_name,
             session_key=session_key,
@@ -531,13 +533,15 @@ async def stream_request(
         # 只更新token和project_id,不重建整个headers和payload
         auth_headers["Authorization"] = f"Bearer {access_token}"
         final_payload["project"] = project_id
+        # 切换账号后同步切换出口，避免继续沿用上一个账号的代理
+        cred_proxy = credential_data.get("proxy") or None
         return True
 
     async def refresh_credential_fast_strict():
         return await refresh_credential_fast(strict_exclude=True)
 
     def apply_cred_result(cred_result: Tuple[str, Dict[str, Any]]) -> bool:
-        nonlocal current_file, access_token, project_id, auth_headers, final_payload
+        nonlocal current_file, access_token, project_id, auth_headers, final_payload, cred_proxy
         current_file, credential_data = cred_result
         if current_file:
             excluded_emails.add(current_file)
@@ -547,6 +551,7 @@ async def stream_request(
             return False
         auth_headers["Authorization"] = f"Bearer {access_token}"
         final_payload["project"] = project_id
+        cred_proxy = credential_data.get("proxy") or None
         return True
 
     for attempt in range(max_retries + 1):
@@ -592,7 +597,8 @@ async def stream_request(
                 url=target_url,
                 body=final_payload,
                 native=native,
-                headers=auth_headers
+                headers=auth_headers,
+                proxy=cred_proxy,
             ):
                 # 判断是否是Response对象
                 if isinstance(chunk, Response):
@@ -882,6 +888,8 @@ async def non_stream_request(
     log_entry["credential_email"] = current_file
     access_token = credential_data.get("access_token") or credential_data.get("token")
     project_id = credential_data.get("project_id", "")
+    # 每账号独立出口：该账号配置了代理则走自己的出口，否则沿用全局 PROXY
+    cred_proxy = credential_data.get("proxy") or None
 
     if not access_token:
         log.error(f"[ANTIGRAVITY] No access token in credential: {current_file}")
@@ -914,7 +922,7 @@ async def non_stream_request(
 
     # 内部函数：快速更新凭证(只更新token和project_id,避免重建整个请求)
     async def refresh_credential_fast(strict_exclude: bool = False):
-        nonlocal current_file, access_token, auth_headers, project_id, final_payload
+        nonlocal current_file, access_token, auth_headers, project_id, final_payload, cred_proxy
         cred_result = await get_valid_credential(
             model_name=model_name,
             session_key=session_key,
@@ -936,13 +944,15 @@ async def non_stream_request(
         # 只更新token和project_id,不重建整个headers和payload
         auth_headers["Authorization"] = f"Bearer {access_token}"
         final_payload["project"] = project_id
+        # 切换账号后同步切换出口，避免继续沿用上一个账号的代理
+        cred_proxy = credential_data.get("proxy") or None
         return True
 
     async def refresh_credential_fast_strict():
         return await refresh_credential_fast(strict_exclude=True)
 
     def apply_cred_result(cred_result: Tuple[str, Dict[str, Any]]) -> bool:
-        nonlocal current_file, access_token, project_id, auth_headers, final_payload
+        nonlocal current_file, access_token, project_id, auth_headers, final_payload, cred_proxy
         current_file, credential_data = cred_result
         if current_file:
             excluded_emails.add(current_file)
@@ -952,6 +962,7 @@ async def non_stream_request(
             return False
         auth_headers["Authorization"] = f"Bearer {access_token}"
         final_payload["project"] = project_id
+        cred_proxy = credential_data.get("proxy") or None
         return True
 
     for attempt in range(max_retries + 1):
@@ -965,7 +976,8 @@ async def non_stream_request(
             response = await post_async(
                 url=target_url,
                 json=final_payload,
-                headers=auth_headers
+                headers=auth_headers,
+                proxy=cred_proxy,
             )
 
             status_code = response.status_code
@@ -1184,9 +1196,16 @@ def _extract_model_ids_from_raw(data: Dict[str, Any]) -> List[str]:
     return model_ids
 
 
-async def fetch_credential_models(access_token: str) -> Optional[List[str]]:
+async def fetch_credential_models(
+    access_token: str,
+    proxy: Optional[str] = None,
+) -> Optional[List[str]]:
     """
     获取单个凭证支持的模型 ID 列表（经过白名单过滤并补全衍生模型）。
+
+    Args:
+        access_token: 凭证访问令牌
+        proxy: 该账号的独立出口代理（None = 沿用全局 PROXY 配置）
 
     Returns:
         成功返回 List[str]，请求失败返回 None
@@ -1201,6 +1220,7 @@ async def fetch_credential_models(access_token: str) -> Optional[List[str]]:
             json={},
             headers=headers,
             timeout=20.0,
+            proxy=proxy,
         )
         if response.status_code == 200:
             data = response.json()
@@ -1243,7 +1263,9 @@ async def refresh_credential_models(
     if not access_token:
         return None
 
-    models = await fetch_credential_models(access_token)
+    models = await fetch_credential_models(
+        access_token, proxy=credential_data.get("proxy") or None
+    )
     if models is not None:
         await update_credential_state(email, {"supported_models": models})
         log.info(f"[ANTIGRAVITY] 已更新凭证 {email} 支持的模型列表 ({len(models)} 个)")
@@ -1320,7 +1342,11 @@ async def fetch_available_models() -> List[Dict[str, Any]]:
     return model_list
 
 
-async def fetch_quota_info(access_token: str, project_id: str = "") -> Dict[str, Any]:
+async def fetch_quota_info(
+    access_token: str,
+    project_id: str = "",
+    proxy: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     获取指定凭证的额度信息（使用 retrieveUserQuotaSummary 获取 weekly+5h 分组配额）
 
@@ -1365,7 +1391,8 @@ async def fetch_quota_info(access_token: str, project_id: str = "") -> Dict[str,
             url=url,
             json=payload,
             headers=headers,
-            timeout=30.0
+            timeout=30.0,
+            proxy=proxy,
         )
 
         if response.status_code != 200:

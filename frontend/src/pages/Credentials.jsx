@@ -8,6 +8,7 @@ import {
   Clock,
   Cpu,
   Download,
+  Globe,
   Loader2,
   RefreshCw,
   Shield,
@@ -41,6 +42,8 @@ export default function Credentials() {
   const [quotaCache, setQuotaCache] = useState({}); // 缓存额度数据 { email: { claude, gemini } | { error } }
   // 支持模型弹窗状态
   const [modelsModal, setModelsModal] = useState(null); // { email, models: [] }
+  // 出口代理弹窗状态
+  const [proxyModal, setProxyModal] = useState(null); // { email, value: "" }
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now() / 1000), 1000);
@@ -191,6 +194,28 @@ export default function Credentials() {
         `测试失败: ${email}`
       );
       fetchCreds();
+    } finally {
+      setBusy(email, false);
+    }
+  };
+
+  const saveProxy = async () => {
+    if (!proxyModal) return;
+    const { email, value } = proxyModal;
+    setBusy(email, true);
+    try {
+      const res = await api.post(`/creds/set-proxy/${encodeURIComponent(email)}`, {
+        proxy: (value || "").trim(),
+      });
+      showMessage("success", res.data.message || "已保存", `出口设置: ${email}`);
+      setProxyModal(null);
+      fetchCreds();
+    } catch (err) {
+      showMessage(
+        "error",
+        err.response?.data?.detail || "设置代理失败",
+        `设置失败: ${email}`
+      );
     } finally {
       setBusy(email, false);
     }
@@ -571,6 +596,14 @@ export default function Credentials() {
                           <CheckCircle size={12} /> 启用
                         </span>
                       )}
+                      {cred.has_proxy && (
+                        <span
+                          className="text-xs px-2 py-0.5 rounded-full border bg-cyan-500/10 text-cyan-400 border-cyan-500/30 flex items-center gap-1"
+                          title="该账号使用独立出口代理"
+                        >
+                          <Globe size={11} /> 独立出口
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -662,6 +695,17 @@ export default function Credentials() {
                         title="导出凭证（邮箱.json）"
                       >
                         <Download size={13} /> 导出
+                      </button>
+                      <button
+                        onClick={() => setProxyModal({ email: cred.email, value: "" })}
+                        className="text-xs px-2 py-1.5 rounded-lg bg-dark-700 hover:bg-dark-600 text-gray-300 flex items-center justify-center gap-1"
+                        title={
+                          cred.has_proxy
+                            ? "该账号已配置独立出口，可修改或留空恢复全局"
+                            : "为该账号配置独立出口代理"
+                        }
+                      >
+                        <Globe size={13} /> 出口
                       </button>
                       <button
                         onClick={() =>
@@ -766,6 +810,51 @@ export default function Credentials() {
               />
               刷新模型列表
             </button>
+          </div>
+        </Modal>
+      )}
+
+      {/* 出口代理弹窗 */}
+      {proxyModal && (
+        <Modal
+          type="info"
+          title={`独立出口 - ${proxyModal.email}`}
+          onClose={() => setProxyModal(null)}
+        >
+          <div className="space-y-3">
+            <div className="text-xs text-gray-400 leading-relaxed">
+              为该账号指定独立出口代理，避免与其他账号共用同一出口 IP。
+              留空保存即恢复使用全局 PROXY 配置。
+            </div>
+            <input
+              type="text"
+              value={proxyModal.value}
+              onChange={(e) =>
+                setProxyModal((prev) => ({ ...prev, value: e.target.value }))
+              }
+              placeholder="socks5://user:pass@host:port"
+              className="w-full text-xs px-3 py-2 rounded-lg bg-dark-900 border border-dark-700 text-gray-200 font-mono focus:outline-none focus:border-purple-500"
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <div className="text-xs text-gray-500">
+              支持 http / https / socks5 / socks5h，可内嵌账号密码。
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={saveProxy}
+                disabled={busyFiles.has(proxyModal.email)}
+                className="flex-1 text-xs py-2 rounded-lg bg-purple-600 hover:bg-purple-500 text-white disabled:opacity-50"
+              >
+                保存
+              </button>
+              <button
+                onClick={() => setProxyModal(null)}
+                className="flex-1 text-xs py-2 rounded-lg bg-dark-700 hover:bg-dark-600 text-gray-300"
+              >
+                取消
+              </button>
+            </div>
           </div>
         </Modal>
       )}

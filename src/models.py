@@ -245,5 +245,10 @@ class CredFileBatchActionRequest(BaseModel):
     emails: List[str]
 
 
+class CredProxyRequest(BaseModel):
+    """设置凭证独立出口代理；空串表示清除（回退全局 PROXY）"""
+    proxy: str = ""
+
+
 class ConfigSaveRequest(BaseModel):
     config: dict

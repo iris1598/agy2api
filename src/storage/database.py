@@ -67,6 +67,9 @@ class AntigravityCredential(Base):
     # tier 状态 (free/pro/ultra)
     tier: Mapped[Optional[str]] = mapped_column(String(32), default="pro")
 
+    # 每账号独立出口代理（空 = 使用全局 PROXY 配置）
+    proxy: Mapped[str] = mapped_column(Text, default="")
+
     # 时间戳
     created_at: Mapped[float] = mapped_column(Float, default=time.time)
     updated_at: Mapped[float] = mapped_column(Float, default=time.time, onupdate=time.time)
@@ -150,6 +153,7 @@ def _row_to_credential_dict(row: AntigravityCredential) -> Dict[str, Any]:
         "client_secret": row.client_secret or "",
         "project_id": row.project_id or "",
         "expiry": row.expiry or "",
+        "proxy": row.proxy or "",
     }
 
 
@@ -380,6 +384,9 @@ class Database:
             expiry = expiry_val.isoformat() if hasattr(expiry_val, "isoformat") else str(expiry_val)
             tier = credential_data.get("tier")
             supported_models = credential_data.get("supported_models")
+            # proxy 仅在调用方显式提供时写入，避免 token 刷新等链路（to_dict 不含该键）
+            # 把已配置的账号代理清空
+            proxy_val = credential_data.get("proxy")
 
             if row:
                 row.access_token = access_token
@@ -392,6 +399,8 @@ class Database:
                     row.tier = tier
                 if isinstance(supported_models, list):
                     row.supported_models = _dump_json(supported_models)
+                if proxy_val is not None:
+                    row.proxy = str(proxy_val)
                 row.updated_at = time.time()
             else:
                 s.add(AntigravityCredential(
@@ -402,6 +411,7 @@ class Database:
                     client_secret=client_secret,
                     project_id=project_id,
                     expiry=expiry,
+                    proxy=str(proxy_val) if proxy_val is not None else "",
                     tier=tier or "pro",
                     supported_models=_dump_json(supported_models) if isinstance(supported_models, list) else "[]",
                     last_success=time.time(),
@@ -544,7 +554,7 @@ class Database:
         """更新凭证状态字段"""
         json_fields = {"error_codes", "error_messages", "model_cooldowns", "supported_models"}
         float_fields = {"last_success"}
-        str_fields = {"user_email", "tier", "project_id"}
+        str_fields = {"user_email", "tier", "project_id", "proxy"}
         bool_fields = {"disabled"}
         async with self.session() as s:
             values: Dict[str, Any] = {}
@@ -586,6 +596,7 @@ class Database:
                 "supported_models": _load_json(row.supported_models, []),
                 "tier": row.tier or "pro",
                 "project_id": row.project_id or "",
+                "has_proxy": bool(row.proxy),
             }
 
     async def get_all_credential_states(self) -> Dict[str, Dict[str, Any]]:
@@ -606,6 +617,7 @@ class Database:
                     "supported_models": _load_json(row.supported_models, []),
                     "tier": row.tier or "pro",
                     "project_id": row.project_id or "",
+                    "has_proxy": bool(row.proxy),
                 }
             return states
 
@@ -750,6 +762,7 @@ class Database:
                     "supported_models": supported_models,
                     "tier": row.tier or "pro",
                     "project_id": row.project_id or "",
+                    "has_proxy": bool(row.proxy),
                 }
                 if tier_filter and tier_filter in ("free", "pro", "ultra"):
                     if summary["tier"] != tier_filter:

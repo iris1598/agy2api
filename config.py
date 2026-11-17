@@ -127,6 +127,31 @@ async def get_config_value(key: str, default: Any = None, env_var: Optional[str]
     return default
 
 
+# 支持的代理协议（带可选内嵌凭据 user:pass@host:port）
+PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
+
+
+def validate_proxy_url(raw: Optional[str]) -> Optional[str]:
+    """校验并规范化代理 URL；不支持/非法时返回 None。
+
+    全局 PROXY 配置与每账号代理共用本函数，保证校验规则与告警文案一致。
+    """
+    if not raw:
+        return None
+
+    proxy_url = str(raw).strip()
+    if not proxy_url:
+        return None
+
+    scheme = proxy_url.split("://", 1)[0].lower()
+    if scheme not in PROXY_SCHEMES:
+        log.warning(
+            f"不支持的代理协议: {scheme}://（支持 http/https/socks5/socks5h），已忽略代理"
+        )
+        return None
+    return proxy_url
+
+
 # Configuration getters - all async
 async def get_proxy_config():
     """Get proxy configuration, validating the URL format.
@@ -134,18 +159,7 @@ async def get_proxy_config():
     Supports http://, https://, socks5://, socks5h:// schemes, all with
     optional embedded credentials (user:pass@host:port).
     """
-    proxy_url = await get_config_value("proxy", env_var="PROXY")
-    if not proxy_url:
-        return None
-
-    proxy_url = proxy_url.strip()
-    scheme = proxy_url.split("://", 1)[0].lower()
-    if scheme not in ("http", "https", "socks5", "socks5h"):
-        log.warning(
-            f"不支持的代理协议: {scheme}://（支持 http/https/socks5/socks5h），已忽略代理"
-        )
-        return None
-    return proxy_url
+    return validate_proxy_url(await get_config_value("proxy", env_var="PROXY"))
 
 
 async def get_auto_ban_enabled() -> bool:

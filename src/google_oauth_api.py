@@ -404,6 +404,7 @@ async def fetch_project_id_and_tier(
     access_token: str,
     user_agent: str,
     api_base_url: str,
+    proxy: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     从 API 获取 project_id 和订阅等级
@@ -412,6 +413,7 @@ async def fetch_project_id_and_tier(
         access_token: Google OAuth access token
         user_agent: User-Agent header
         api_base_url: API base URL (e.g., antigravity endpoint)
+        proxy: 该账号的独立出口代理（None = 沿用全局 PROXY 配置）
 
     Returns:
         (project_id, subscription_tier)
@@ -443,7 +445,7 @@ async def fetch_project_id_and_tier(
 
     # 步骤 1: 尝试 loadCodeAssist
     try:
-        project_id, raw_tier = await _try_load_code_assist(api_base_url, headers)
+        project_id, raw_tier = await _try_load_code_assist(api_base_url, headers, proxy)
         subscription_tier = _map_raw_tier(raw_tier)
 
         if raw_tier:
@@ -466,7 +468,8 @@ async def fetch_project_id_and_tier(
 
 async def _try_load_code_assist(
     api_base_url: str,
-    headers: dict
+    headers: dict,
+    proxy: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     尝试通过 loadCodeAssist 获取 project_id 和订阅等级
@@ -490,6 +493,7 @@ async def _try_load_code_assist(
         json=request_body,
         headers=headers,
         timeout=30.0,
+        proxy=proxy,
     )
 
     log.debug(f"[loadCodeAssist] Response status: {response.status_code}")

@@ -22,7 +22,8 @@ from src.credential_manager import (
 )
 from src.models import (
     CredFileActionRequest,
-    CredFileBatchActionRequest
+    CredFileBatchActionRequest,
+    CredProxyRequest,
 )
 from src.storage.database import get_database
 from src.utils import (
@@ -36,6 +37,7 @@ from src.api.antigravity import (
     build_antigravity_headers,
     fetch_credential_models,
     refresh_credential_models,
+    wrap_cli_request,
 )
 from src.httpx_client import post_async
 from src.google_oauth_api import (
@@ -43,11 +45,32 @@ from src.google_oauth_api import (
     fetch_project_id_and_tier,
     get_user_email,
 )
-from config import get_antigravity_api_url
+from config import get_antigravity_api_url, validate_proxy_url
 
 
 # 创建路由器
 router = APIRouter(prefix="/creds", tags=["credentials"])
+
+
+# =============================================================================
+# 凭证探活（/test）
+# =============================================================================
+
+# 探活文本：用完整短句而非单字 "hi"，避免「单 token 探针」特征
+_PROBE_TEXT = "你好，请回复一个字。"
+
+# supported_models 为空（尚未探测）时的回退探活模型
+_FALLBACK_PROBE_MODEL = "gemini-2.5-flash-lite"
+
+
+def _pick_probe_model(supported_models: list) -> str:
+    """从凭证支持的模型里挑一个用于探活（优先级 flash-lite > flash > gemini）。"""
+    models = [m for m in (supported_models or []) if isinstance(m, str) and m]
+    for keyword in ("flash-lite", "flash", "gemini"):
+        for model in models:
+            if keyword in model.lower():
+                return model
+    return models[0] if models else _FALLBACK_PROBE_MODEL
 
 
 # =============================================================================
@@ -427,6 +450,9 @@ async def verify_credential_project_common(email: str) -> JSONResponse:
     if not credential_data:
         raise HTTPException(status_code=404, detail="凭证不存在")
 
+    # 出口代理不在 Credentials.to_dict() 中，刷新 token 会重建 dict，需先取出
+    cred_proxy = credential_data.get("proxy") or None
+
     credentials = Credentials.from_dict(credential_data)
 
     token_refreshed = await credentials.refresh_if_needed()
@@ -442,6 +468,7 @@ async def verify_credential_project_common(email: str) -> JSONResponse:
         access_token=credentials.access_token,
         user_agent=ANTIGRAVITY_USER_AGENT,
         api_base_url=api_base_url,
+        proxy=cred_proxy,
     )
 
     # project_id 获取失败时回退，避免空值入库
@@ -458,7 +485,9 @@ async def verify_credential_project_common(email: str) -> JSONResponse:
     # 同步刷新该凭证支持的模型列表
     supported_models = old_state.get("supported_models", [])
     try:
-        fetched_models = await fetch_credential_models(credentials.access_token)
+        fetched_models = await fetch_credential_models(
+            credentials.access_token, proxy=cred_proxy
+        )
         if fetched_models is not None:
             supported_models = fetched_models
     except Exception as e:
@@ -740,6 +769,48 @@ async def refresh_cred_models_endpoint(
         raise HTTPException(status_code=500, detail=f"刷新模型列表失败: {str(e)}")
 
 
+@router.post("/set-proxy/{email}")
+async def set_credential_proxy(
+    email: str,
+    request: CredProxyRequest,
+    token: str = Depends(verify_panel_token),
+):
+    """设置凭证的独立出口代理（空串 = 清除，回退全局 PROXY）"""
+    try:
+        database = await get_database()
+        state = await database.get_credential_state(email)
+        if not state.get("email"):
+            raise HTTPException(status_code=404, detail="凭证不存在")
+
+        raw = (request.proxy or "").strip()
+        if raw:
+            proxy_url = validate_proxy_url(raw)
+            if not proxy_url:
+                raise HTTPException(
+                    status_code=400,
+                    detail="代理格式无效，仅支持 http/https/socks5/socks5h（含可选 user:pass@host:port）",
+                )
+        else:
+            proxy_url = ""
+
+        if not await database.update_credential_state(email, {"proxy": proxy_url}):
+            raise HTTPException(status_code=500, detail="保存代理配置失败")
+
+        log.info(f"已更新凭证出口: {email} -> {'独立代理' if proxy_url else '全局配置'}")
+        return JSONResponse(content={
+            "success": True,
+            "email": email,
+            "has_proxy": bool(proxy_url),
+            "message": "已设置独立出口" if proxy_url else "已恢复使用全局出口",
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"设置凭证代理失败 {email}: {e}")
+        raise HTTPException(status_code=500, detail=f"设置代理失败: {str(e)}")
+
+
 @router.get("/errors/{email}")
 async def get_credential_errors(
     email: str,
@@ -769,6 +840,9 @@ async def get_credential_quota(
         if not credential_data:
             raise HTTPException(status_code=404, detail="凭证不存在")
 
+        # 出口代理不在 Credentials.to_dict() 中，刷新 token 会重建 dict，需先取出
+        cred_proxy = credential_data.get("proxy") or None
+
         creds = Credentials.from_dict(credential_data)
 
         await creds.refresh_if_needed()
@@ -783,7 +857,11 @@ async def get_credential_quota(
         if not access_token:
             raise HTTPException(status_code=400, detail="凭证中没有访问令牌")
 
-        quota_info = await fetch_quota_info(access_token, credential_data.get("project_id", ""))
+        quota_info = await fetch_quota_info(
+            access_token,
+            credential_data.get("project_id", ""),
+            proxy=cred_proxy,
+        )
 
         if quota_info.get("success"):
             result = {
@@ -832,6 +910,9 @@ async def test_credential(
         if not credential_data:
             raise HTTPException(status_code=404, detail="凭证不存在")
 
+        # 出口代理不在 Credentials.to_dict() 中，刷新 token 会重建 dict，需先取出
+        cred_proxy = credential_data.get("proxy") or None
+
         credentials = Credentials.from_dict(credential_data)
         token_refreshed = await credentials.refresh_if_needed()
 
@@ -848,22 +929,28 @@ async def test_credential(
         if not project_id:
             raise HTTPException(status_code=400, detail="凭证中没有项目ID")
 
-        test_model = "gemini-2.5-flash-lite"
+        # 探活模型：优先用该凭证实际支持的模型，避免不支持时拿到 404 产生假阴性
+        state = await database.get_credential_state(email)
+        supported_models = state.get("supported_models") or []
+        test_model = _pick_probe_model(supported_models)
 
         api_base_url = await get_antigravity_api_url()
         headers = build_antigravity_headers(access_token)
 
+        # 报文与真实请求同构：走 wrap_cli_request 补齐
+        # requestId / sessionId / labels / userAgent / requestType 六段信封，
+        # 不手写 payload（裸 {model, project, request} 不是任何正版客户端的形态）
+        gemini_request = {
+            "contents": [{"role": "user", "parts": [{"text": _PROBE_TEXT}]}]
+        }
+        final_payload, _ = await wrap_cli_request(gemini_request, test_model, project_id)
+
         response = await post_async(
             url=f"{api_base_url}/v1internal:generateContent",
-            json={
-                "model": test_model,
-                "project": project_id,
-                "request": {
-                    "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
-                }
-            },
+            json=final_payload,
             headers=headers,
-            timeout=30.0
+            timeout=30.0,
+            proxy=cred_proxy,
         )
 
         status_code = response.status_code
