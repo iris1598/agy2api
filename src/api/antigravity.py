@@ -34,7 +34,7 @@ from src.request_pacer import request_pacer
 from src.models import Model, model_to_dict
 from src.storage.database import get_database
 from src.utils import ANTIGRAVITY_USER_AGENT
-from src.session_cache import derive_session_key
+from src.session_cache import derive_conversation_anchor, derive_session_key
 from src.usage_log import (
     extract_usage_tokens,
     new_request_id,
@@ -54,23 +54,31 @@ from src.api.utils import (
 # ==================== 全局凭证管理器 ====================
 
 
-def _extract_first_user_text(request_payload: Dict[str, Any]) -> str:
-    contents = request_payload.get("contents", [])
-    if not isinstance(contents, list):
-        return ""
-    for content in contents:
-        if not isinstance(content, dict) or content.get("role") != "user":
-            continue
-        parts = content.get("parts", [])
-        if not isinstance(parts, list):
-            continue
-        for part in parts:
-            if isinstance(part, dict) and part.get("text"):
-                return str(part["text"])
-    return ""
+def _derive_upstream_session_ids(
+    gemini_request: Dict[str, Any], model: str
+) -> Tuple[str, str]:
+    """
+    从联合锚点摘要确定性派生上游 (sessionId, trajectory_id)。
+
+    联合锚点 = SHA256(model + systemInstruction 文本 + 前两条消息特征)，
+    与 derive_session_key 同口径，保证:
+    - 同一会话跨轮次/跨请求 sessionId、trajectory_id 恒定（KV 缓存路由亲和）；
+    - 共用相同 systemInstruction 的不同会话（多 Agent / 主子会话）不会撞车；
+    - 摘要前 8 字节 → sessionId（沿用既有 -{int} 形态）；
+    - 摘要 8~24 字节 → 16 字节确定性 UUID 形态 trajectory_id。
+
+    无锚点（如空对话）时返回 ("", "")，由调用方兜底。
+    """
+    digest = derive_conversation_anchor(model, gemini_request)
+    if digest is None:
+        return "", ""
+    session_int = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+    session_id = f"-{session_int}"
+    trajectory_id = str(uuid.UUID(bytes=digest[8:24]))
+    return session_id, trajectory_id
 
 
-def _generate_request_id(session_id: str, step: int) -> str:
+def _generate_request_id(session_id: str, step: int, trajectory_id: str) -> str:
     """构造官方形态的 requestId：`agent/{conversationId}/{unixMs}/{trajectoryId}/{step}`。
 
     官方样本（3 份报文逐字核对），例如：
@@ -78,15 +86,17 @@ def _generate_request_id(session_id: str, step: int) -> str:
 
     - conversationId 段使用 sessionId 的单向哈希派生而非原文，同一会话稳定；
     - unixMs 段每次请求都不同 → 天然的幂等隔离，避免重试命中上一次的 429 / 旧缓存；
-    - trajectoryId 段每请求唯一，与 unixMs 共同保证幂等隔离。
+    - trajectoryId 段同一会话恒定（确定性派生自会话锚点），上游据此关联同一轨迹的
+      连续 step，保证隐式 KV 缓存的路由亲和；不同会话天然隔离。
     """
     ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     if session_id:
         conversation = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
     else:
         conversation = str(uuid.uuid4())
-    trajectory = uuid.uuid4().hex[:8]
-    return f"agent/{conversation}/{ts_ms}/{trajectory}/{step}"
+    if not trajectory_id:
+        trajectory_id = str(uuid.uuid4())
+    return f"agent/{conversation}/{ts_ms}/{trajectory_id}/{step}"
 
 
 def _build_labels(model: str, trajectory_id: str, step: int) -> Dict[str, str]:
@@ -102,6 +112,9 @@ def _build_labels(model: str, trajectory_id: str, step: int) -> Dict[str, str]:
       "used_claude_conservative": "false",
       "used_non_gemini_model": "false"
     }
+
+    step 传入「当前步索引」（模型轮数 + 1），与顶层 requestId 末段同步，
+    request_id 同步使用该值。
     """
     model_lower = model.lower() if model else ""
     used_claude = "claude" in model_lower
@@ -199,33 +212,37 @@ async def wrap_cli_request(
     # 避免对大 payload（长对话历史）做整体 deepcopy 的热路径开销；
     # contents 等未修改字段与调用方共享引用（调用方随后不再修改）
     inner = dict(gemini_request)
-    first_user_text = _extract_first_user_text(inner)
 
-    # 注入 sessionId（会话段使用首个 user 文本哈希派生，同会话稳定利于前缀缓存）
+    # 注入 sessionId（联合锚点 = model + systemInstruction + 前两条消息特征，
+    # 与 derive_session_key 同口径）：同会话跨轮次恒定，共 system 的不同会话不撞车，
+    # 上游据此做隐式 KV 缓存的路由亲和；客户端显式携带 sessionId 时原样透传
     session_id = str(inner.get("sessionId") or "").strip()
+    derived_session_id, derived_trajectory_id = _derive_upstream_session_ids(inner, model)
     if not session_id:
-        if first_user_text:
-            digest = hashlib.sha256(first_user_text.encode("utf-8")).digest()
-            session_id_val = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
-            session_id = f"-{session_id_val}"
-        else:
-            session_id = f"-{uuid.uuid4().int % 9_000_000_000_000_000_000}"
+        session_id = derived_session_id or f"-{uuid.uuid4().int % 9_000_000_000_000_000_000}"
         inner["sessionId"] = session_id
 
-    # step：以 contents 历史轮次为基准
-    step = 1
+    # step：以 contents 中已完成的模型轮数为基准（当前步 = 模型轮数 + 1），
+    # 同步写入 requestId 末段与 labels（last_step_index / request_id 后缀），
+    # 保证轨迹元数据随对话轮次连续递增
+    model_turns = 0
     contents = inner.get("contents")
-    if isinstance(contents, list) and contents:
-        step = max(1, len(contents))
+    if isinstance(contents, list):
+        model_turns = sum(
+            1
+            for content in contents
+            if isinstance(content, dict) and content.get("role") == "model"
+        )
+    step = model_turns + 1
 
     # requestId：官方 5 段形态 agent/{conversationId}/{unixMs}/{trajectoryId}/{step}
-    request_id = _generate_request_id(session_id, step)
-    # trajectory_id 从 requestId 第 4 段提取（与顶层 requestId 严格同步一致）
-    rid_parts = request_id.split("/")
-    trajectory_id = rid_parts[3] if len(rid_parts) >= 5 else str(uuid.uuid4())
+    # trajectoryId 与 sessionId 同源确定性派生（无锚点时各自随机兜底），
+    # 与顶层 requestId 严格同步一致
+    trajectory_id = derived_trajectory_id or str(uuid.uuid4())
+    request_id = _generate_request_id(session_id, step, trajectory_id)
 
-    # 注入 labels（last_step_index 即上一步已完成索引 step - 1）
-    inner["labels"] = _build_labels(model, trajectory_id, max(0, step - 1))
+    # 注入 labels（step 即当前步索引，与 requestId 末段同步）
+    inner["labels"] = _build_labels(model, trajectory_id, step)
 
     # requestType 与 toolConfig 对齐官方 agent 状态机：
     # - 常规智能体交互（有 tools 或含工具调用上下文）→ agent；

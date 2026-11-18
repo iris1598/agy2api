@@ -265,7 +265,7 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 **凭证选择模式**
 - `CREDENTIAL_SELECT_MODE`: 凭证选择模式（默认：cache）
   - `random` — 完全随机负载均衡，每次请求随机挑选凭证
-  - `cache` — 缓存匹配（推荐）：以"模型 + system 指令（或首条 user 消息）"哈希会话 key，相同会话复用同一凭证，命中 Google 上游 prompt cache；凭证 CD 后自动切换并重新绑定
+  - `cache` — 缓存匹配（推荐）：以"模型 + system 指令 + 前两条消息特征"联合哈希会话 key，相同会话复用同一凭证，命中 Google 上游 prompt cache；凭证 CD 后自动切换并重新绑定
   - `sticky` — 凭证粘性：所有请求锁定同一凭证，直到其进入 CD 或被禁用
 - `REDIS_URL`: Redis 连接串（可选）。设置后缓存匹配的会话绑定存入 Redis，多实例共享；未设置时使用进程内存后端
 

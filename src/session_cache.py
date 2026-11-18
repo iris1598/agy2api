@@ -16,7 +16,7 @@ import asyncio
 import hashlib
 import json
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from log import log
 
@@ -84,10 +84,103 @@ async def close() -> None:
 
 # ====================== 会话 key 派生 ======================
 
+def _stable_json(value: Any) -> Optional[str]:
+    """稳定序列化（排序键），失败返回 None"""
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+
+
+def _anchor_part_feature(part: Any) -> Optional[str]:
+    """提取单个 part 的稳定特征（文本或首个 functionCall 的名称+参数）。"""
+    if not isinstance(part, dict):
+        return None
+    if isinstance(part.get("text"), str) and part["text"]:
+        return f"text:{part['text']}"
+    fc = part.get("functionCall") or part.get("function_call")
+    if isinstance(fc, dict):
+        name = fc.get("name") or ""
+        args_json = _stable_json(fc.get("args"))
+        if args_json is not None:
+            return f"fc:{name}:{args_json}"
+        return f"fc:{name}"
+    return None
+
+
+def _anchor_message_features(content: Any) -> Optional[str]:
+    """提取一条消息的稳定特征（按 part 顺序拼接，最多取前 4 个 part）。"""
+    if not isinstance(content, dict):
+        return None
+    parts = content.get("parts")
+    if not isinstance(parts, list):
+        return None
+    features = []
+    for part in parts[:4]:
+        feature = _anchor_part_feature(part)
+        if feature is not None:
+            features.append(feature)
+    return "|".join(features) if features else None
+
+
+def derive_conversation_anchor(
+    model_name: str, gemini_request: Dict[str, Any]
+) -> Optional[bytes]:
+    """
+    派生会话联合锚点摘要: SHA256(model + systemInstruction 文本 + 前两条消息特征)。
+
+    联合摘要同时供两处使用，保证锚点口径一致:
+    - derive_session_key: 凭证亲和会话 key
+    - wrap_cli_request: 上游 sessionId / trajectory_id 派生
+
+    锚点必须包含前两条消息特征，避免共用相同 systemInstruction 的
+    不同会话（多 Agent / 主子会话场景）派生出相同的 key 发生撞车。
+
+    必须在格式转换完成后调用（openai2gemini / anthropic2gemini / 原生 gemini 都已
+    转成 Gemini 格式），保证不同 API 格式的相同内容派生相同的锚点。
+
+    Returns:
+        32 字节 SHA256 摘要；无法派生锚点时返回 None
+    """
+    if not isinstance(gemini_request, dict):
+        return None
+
+    model_part = model_name if isinstance(model_name, str) else ""
+
+    # systemInstruction 文本（对话稳定的锚点之一）
+    system_text = ""
+    system_instruction = gemini_request.get("systemInstruction")
+    if isinstance(system_instruction, dict):
+        parts = system_instruction.get("parts")
+        if isinstance(parts, list):
+            texts = [
+                str(part.get("text"))
+                for part in parts
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            ]
+            system_text = "\n".join(texts)
+
+    # 前两条消息特征（区分同 systemInstruction 下的不同会话）
+    message_features: List[str] = []
+    contents = gemini_request.get("contents")
+    if isinstance(contents, list):
+        for content in contents[:2]:
+            feature = _anchor_message_features(content)
+            if feature is not None:
+                message_features.append(feature)
+    messages_part = "\x1f".join(message_features)
+
+    if not system_text and not messages_part:
+        return None
+
+    anchor_material = f"{model_part}\x1e{system_text}\x1e{messages_part}"
+    return hashlib.sha256(anchor_material.encode("utf-8")).digest()
+
+
 def derive_session_key(model_name: str, gemini_request: Dict[str, Any]) -> Optional[str]:
     """
     从规范化后的 Gemini 请求派生会话 key:
-    hash(模型 + systemInstruction 或 第一条 user 消息)
+    hash(模型 + systemInstruction 文本 + 前两条消息特征)
 
     必须在格式转换完成后调用（openai2gemini / anthropic2gemini / 原生 gemini 都已
     转成 Gemini 格式），保证不同 API 格式的相同内容派生相同的 key。
@@ -95,43 +188,10 @@ def derive_session_key(model_name: str, gemini_request: Dict[str, Any]) -> Optio
     Returns:
         "auto:<hash>" 或 None（无法派生时）
     """
-    if not isinstance(gemini_request, dict):
+    digest = derive_conversation_anchor(model_name, gemini_request)
+    if digest is None:
         return None
-
-    model_part = model_name if isinstance(model_name, str) else ""
-
-    # 优先 systemInstruction（对话稳定的锚点）
-    anchor = None
-    system_instruction = gemini_request.get("systemInstruction")
-    if isinstance(system_instruction, dict):
-        parts = system_instruction.get("parts")
-        if isinstance(parts, list) and parts:
-            anchor = _stable_json(parts)
-
-    # 没有 system 时取第一条 user 消息的 parts
-    if anchor is None:
-        contents = gemini_request.get("contents")
-        if isinstance(contents, list):
-            for content in contents:
-                if isinstance(content, dict) and content.get("role") == "user":
-                    parts = content.get("parts")
-                    if isinstance(parts, list) and parts:
-                        anchor = _stable_json(parts)
-                        break
-
-    if anchor is None:
-        return None
-
-    digest = hashlib.sha256(f"{model_part}|{anchor}".encode("utf-8")).hexdigest()
-    return f"auto:{digest[:32]}"
-
-
-def _stable_json(value: Any) -> Optional[str]:
-    """稳定序列化（排序键），失败返回 None"""
-    try:
-        return json.dumps(value, sort_keys=True, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return None
+    return f"auto:{digest.hex()[:32]}"
 
 
 # ====================== 绑定读写 ======================

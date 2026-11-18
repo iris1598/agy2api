@@ -9,9 +9,9 @@ Antigravity Format Utilities - 独立的 Antigravity 请求处理和转换工具
 按项目要求:
 - 使用 print 输出 warning/error，去掉 debug 日志
 """
+import hashlib
 import json
 import re
-import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -438,6 +438,25 @@ def _normalize_part_thought_signature(part: Dict[str, Any], model_name: str) -> 
     return normalized
 
 
+def _stable_json(value: Any) -> Optional[str]:
+    """稳定序列化（排序键），失败返回 None"""
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+
+
+def _deterministic_tool_id(material: str) -> str:
+    """基于稳定材料确定性派生 toolu_ 前缀 ID（截断 32 hex）。
+
+    同一段历史在多轮往返中补全出的 ID 恒定不变，保证 Claude 路径下
+    KV 缓存依赖的前缀 token 序列字节级一致（随机 ID 会使前缀哈希
+    从缺失处开始全部改变，导致上游缓存彻底失效）。
+    """
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return f"toolu_{digest[:32]}"
+
+
 def _ensure_tool_call_ids(contents: Any, model_name: str) -> Any:
     """
     确保 functionCall/functionResponse 携带 id 字段 (仅 Claude)。
@@ -447,6 +466,10 @@ def _ensure_tool_call_ids(contents: Any, model_name: str) -> Any:
     tool_use/tool_result，而后者的 id 是必填字段。原生 Gemini 请求
     可能不带 id，因此这里按 name 补全缺失的 id，保证同一次调用的
     functionCall 与 functionResponse 使用相同 id。不修改入参。
+
+    缺失的 id 按「消息序号 + part 序号 + 函数名 + 载荷 JSON」确定性
+    派生：历史前缀索引跨轮次稳定（append-only），因此同一历史补全出的
+    ID 恒定，不会破坏多轮历史的字节级前缀一致性。
     """
     if "claude" not in (model_name or "").lower():
         return contents
@@ -456,19 +479,21 @@ def _ensure_tool_call_ids(contents: Any, model_name: str) -> Any:
     pending_ids_by_name: Dict[str, list] = {}
     result = []
 
-    for content in contents:
+    for content_index, content in enumerate(contents):
         if not isinstance(content, dict) or not isinstance(content.get("parts"), list):
             result.append(content)
             continue
 
         new_parts = []
-        for part in content["parts"]:
+        for part_index, part in enumerate(content["parts"]):
             if isinstance(part, dict):
                 fc = part.get("functionCall")
                 fr = part.get("functionResponse")
                 if isinstance(fc, dict):
                     if not fc.get("id"):
-                        fc = {**fc, "id": f"toolu_{uuid.uuid4().hex}"}
+                        args_json = _stable_json(fc.get("args"))
+                        material = f"{content_index}:{part_index}:{fc.get('name')}:{args_json}"
+                        fc = {**fc, "id": _deterministic_tool_id(material)}
                         part = {**part, "functionCall": fc}
                     pending_ids_by_name.setdefault(fc.get("name"), []).append(fc["id"])
                 elif isinstance(fr, dict):
@@ -477,7 +502,12 @@ def _ensure_tool_call_ids(contents: Any, model_name: str) -> Any:
                         if fr["id"] in queue:
                             queue.remove(fr["id"])
                     else:
-                        new_id = queue.pop(0) if queue else f"toolu_{uuid.uuid4().hex}"
+                        if queue:
+                            new_id = queue.pop(0)
+                        else:
+                            response_json = _stable_json(fr.get("response"))
+                            material = f"{content_index}:{part_index}:{fr.get('name')}:{response_json}"
+                            new_id = _deterministic_tool_id(material)
                         part = {**part, "functionResponse": {**fr, "id": new_id}}
             new_parts.append(part)
 

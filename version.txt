@@ -1,4 +1,4 @@
-full_hash=ca34911693513dabe78527c2caea0ae654723ee9
-short_hash=ca34911
-message=对齐官方 Antigravity Hub 出站报文结构与指纹
-date=2026-11-16 23:16:57 +0800
+full_hash=3681773e94fcd452453fa0283d1e81342ee82315
+short_hash=3681773
+message=修复多会话场景下上游 KV 缓存频繁失效的问题 (#450)
+date=2026-11-17 19:51:05 +0800
