@@ -1315,11 +1315,15 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
     pending_tool_parts = []
 
     def flush_pending_tool_parts():
-        """将累积的 tool parts 作为单个 contents 条目追加"""
+        """将累积的 tool parts 作为单个 contents 条目追加。
+
+        role=model：实抓 2.34.0（114847/0014、112701/0011）中真实客户端的
+        functionResponse 消息是 role=model，不是 Gemini 公开 API 惯例的 user。
+        """
         nonlocal pending_tool_parts
         if pending_tool_parts:
             contents.append({
-                "role": "user",
+                "role": "model",
                 "parts": pending_tool_parts
             })
             pending_tool_parts = []

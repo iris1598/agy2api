@@ -380,3 +380,38 @@ portable Go 1.27.4 编译的。临时目录不保证长期存在，接手者需�
 - 踩坑记录：`build.ps1`/`build-all.ps1` 中文注释无 BOM → PS 5.1 按 GBK 解析报
   语法错误，已补 UTF-8 BOM（与 install.ps1 同类问题）。
 - 本机无系统 Go：portable Go 1.27.4 下载到仓库外临时目录，`build.ps1 -Go` 重建。
+
+### 10.8 第三轮：实抓基准修正（owner 指正"以最新几条实抓为准"）
+
+**关键指正**：101457（297 条）/101904（193 条）两个长序列是**工具损坏导致的重试风暴，
+不作数**（tools 全 user 角色、step 每请求 +2 的异常形态均源于此）。交接文档 §3.6 的
+step 规律（`step = 1 + 2×(contents 中 role=="model" 的消息数)`，"192 条 model"）就是对
+风暴样本的误读。以工具正常的最新会话（112035/112144/112701/114847）为准。
+
+1. **step 公式修正**：真实规律为 `step = 1 + 2×(model 轮数)`，**functionResponse
+   不计入轮**（工具输出不是一次模型回复）。证据（轨迹 0f52941f，114847）：
+   `[user]`→1；`[user, model(fc), model(fr)]`→3；`[user, model(fc), model(fr),
+   model(text), user]`→5。裸数 role==model 的旧实现在含工具轮的历史上会多算
+   （0016 形态算出 7）。实现：`build_envelope_parts` 的轮数统计排除仅含
+   functionResponse 的 model content；测试 `test_step_excludes_function_response_rounds`。
+
+2. **functionResponse role 修正**：真实客户端的工具输出消息是 **role=model**
+   （114847/0014、112701/0011），非 Gemini 公开 API 惯例的 user。修正
+   `openai2gemini.flush_pending_tool_parts`、`anthropic2gemini` 主路径（与文本
+   混合时拆分独立 content）与 `reorganize_tool_messages`；同时给
+   `_strip_trailing_model_turns` 加豁免（含 functionResponse 的 model 消息是
+   工具续跑请求的合法结尾，不按"预填充"剥离——否则工具续跑会被截断）。
+
+3. **labels 三形态确认**（最新会话）：九键（标准）/ 11 键（子代理，含
+   `parent_cascade_id`+`subagent_type`，0015）/ **10 键（含 `last_execution_id`，
+   0016，出现在上一请求完成工具执行之后的下一请求）**。交接文档 §3.5
+   "不再有 last_execution_id" 被最新实抓推翻。**未实现**：last_execution_id 的值
+   （ac34ec93…）未出现在会话其它任何捕获文件中（0014 响应仅 354 字节，疑似错误
+   响应，execution id 来源未捕获）——凭空生成违反"不伪造"，待补抓一次完整
+   工具执行的请求-响应对后实现（插入位置：cascade_id 之后，字母序）。
+
+4. **黄金样本更新**：实抓对照/黄金形状测试样本从 0307（风暴）换成
+   114847/0014（九键+工具轮）；原先引用已删除的 20261120-125431 目录而一直
+   skip 的 `test_envelope_matches_captured_sample_shape` 现已真正运行。
+   `test_go_envelope_bytes.py` 三个测试（格式环/实抓环/字节等价环）全部基于
+   最新有效样本。

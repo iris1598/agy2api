@@ -336,19 +336,31 @@ async def build_envelope_parts(
         )
         inner["sessionId"] = session_id
 
-    # step：实抓规律为 step = 1 + 2 * (contents 中 model 消息数)。
-    # 依据 2.34.0 样本（20261121-112701 / 101904 全序列）：
-    #   model 消息 0 条 → step=1；1 条（含工具调用）→ step=3；2 条 → step=5；
-    #   101904 连续重试序列 193 条 contents / 192 条 model → step=385，完全吻合。
-    # labels.last_step_index = step - 1。
+    # step：实抓规律为 step = 1 + 2 × (model 轮数)。
+    # "model 轮"= 一次模型回复（最终文本或 functionCall），**functionResponse
+    # 不算轮**——它是用户侧提供的工具输出，不是一次模型回复。
+    # 实抓证据（2.34.0，工具正常的最末会话，owner 2026-11-21 指正：
+    # 101457/101904 两个长序列是工具损坏导致的重试风暴，不作数）：
+    #   114847/0010 [user]                                    → step=1
+    #   114847/0014 [user, model(fc), model(fr)]              → step=3（fr 不计）
+    #   114847/0016 [user, model(fc), model(fr), model(text),
+    #                user]                                     → step=5
+    #   112701/0011 [user, model(fc), model(fr)]              → step=3
+    # 即同一轨迹内每完成一轮交互 step+2；labels.last_step_index = step - 1。
+    # 注意裸数 role=="model" 的旧公式在含 functionResponse 的历史上会多算。
+    def _is_model_response_turn(content: Any) -> bool:
+        if not (isinstance(content, dict) and content.get("role") == "model"):
+            return False
+        parts = content.get("parts") or []
+        # 仅由 functionResponse 组成的内容是工具输出，不计入轮数
+        return not all(
+            isinstance(part, dict) and "functionResponse" in part for part in parts
+        ) if parts else False
+
     model_turns = 0
     contents = inner.get("contents")
     if isinstance(contents, list):
-        model_turns = sum(
-            1
-            for content in contents
-            if isinstance(content, dict) and content.get("role") == "model"
-        )
+        model_turns = sum(1 for content in contents if _is_model_response_turn(content))
     step = 1 + 2 * model_turns
 
     # cascadeId / trajectoryId 与 sessionId 同源确定性派生（无锚点时各自随机兜底），

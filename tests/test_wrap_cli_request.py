@@ -124,8 +124,12 @@ async def test_step_increments_with_model_turns():
 
 
 async def test_tool_round_step_matches_real_sample():
-    """实抓 20261121-112701/0011：user + model(functionCall) + user(functionResponse)
-    → requestId 末段 3、last_step_index 2、request_id 后缀从 0 开始。"""
+    """实抓 20261121-112701/0011（真实客户端形态）：user + model(functionCall) +
+    model(functionResponse)（functionResponse 的 role=model）→ requestId 末段 3、
+    last_step_index 2、request_id 后缀从 0 开始。
+
+    step 规律：functionResponse 不计入 model 轮（工具输出不是模型回复）。
+    """
     request = _req([
         {"role": "user", "parts": [{"text": "读一下探测文件"}]},
         {
@@ -133,7 +137,7 @@ async def test_tool_round_step_matches_real_sample():
             "parts": [{"functionCall": {"name": "read_file", "args": {"Path": "x"}}}],
         },
         {
-            "role": "user",
+            "role": "model",
             "parts": [{"functionResponse": {"name": "read_file", "response": {"output": "ok"}}}],
         },
     ])
@@ -141,6 +145,21 @@ async def test_tool_round_step_matches_real_sample():
     assert rid.split("/")[4] == "3"
     assert payload["request"]["labels"]["last_step_index"] == "2"
     assert payload["request"]["labels"]["request_id"].endswith("-0")
+
+
+async def test_step_excludes_function_response_rounds():
+    """实抓 20261121-114847/0016 形态:[user, model(fc), model(fr), model(text), user]
+    → step=5(fr 不计轮)。若裸数 role==model 会错算成 7。"""
+    request = _req([
+        {"role": "user", "parts": [{"text": "查一下"}]},
+        {"role": "model", "parts": [{"functionCall": {"name": "read_file", "args": {"Path": "x"}}}]},
+        {"role": "model", "parts": [{"functionResponse": {"name": "read_file", "response": {"output": "ok"}}}]},
+        {"role": "model", "parts": [{"text": "结果是……"}]},
+        {"role": "user", "parts": [{"text": "继续"}]},
+    ])
+    payload, rid = await wrap_cli_request(request, MODEL, "proj")
+    assert rid.split("/")[4] == "5"
+    assert payload["request"]["labels"]["last_step_index"] == "4"
 
 
 async def test_shared_system_sessions_isolated():
@@ -248,8 +267,8 @@ _CAPTURE_SAMPLE = (
     / "tools"
     / "antigravity_capture"
     / "captures"
-    / "20261120-125431"
-    / "0009_streamGenerateContent.request.json"
+    / "20261121-114847"
+    / "0014_streamGenerateContent.request.bin"
 )
 
 
@@ -258,7 +277,8 @@ _CAPTURE_SAMPLE = (
     reason="缺少实抓样本（tools/antigravity_capture/captures 已被 gitignore）",
 )
 async def test_envelope_matches_captured_sample_shape():
-    """与实抓报文做结构级黄金对照（不比较 UUID / 时间戳等易变值）。"""
+    """与实抓报文（114847/0014，工具轮九键形态）做结构级黄金对照
+    （不比较 UUID / 时间戳等易变值）。"""
     sample = json.loads(_CAPTURE_SAMPLE.read_text(encoding="utf-8"))
     payload, _rid = await wrap_cli_request(_session_a_turn3(), "gemini-3-pro-preview", "proj")
 

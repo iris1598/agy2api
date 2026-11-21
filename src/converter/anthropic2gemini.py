@@ -553,7 +553,17 @@ def convert_messages_to_contents(
         if not parts:
             continue
 
-        contents.append({"role": gemini_role, "parts": parts})
+        # functionResponse 的 role 必须是 model（实抓 2.34.0：真实客户端的
+        # 工具输出消息为 role=model，非 Gemini 公开 API 惯例的 user）；
+        # 与文本混在同一 user 消息时拆成两条，保持各自 role 正确
+        fr_parts = [p for p in parts if isinstance(p, dict) and "functionResponse" in p]
+        other_parts = [p for p in parts if not (isinstance(p, dict) and "functionResponse" in p)]
+        if fr_parts:
+            if other_parts:
+                contents.append({"role": gemini_role, "parts": other_parts})
+            contents.append({"role": "model", "parts": fr_parts})
+        else:
+            contents.append({"role": gemini_role, "parts": parts})
 
     return contents
 
@@ -592,7 +602,8 @@ def reorganize_tool_messages(contents: List[Dict[str, Any]]) -> List[Dict[str, A
             new_contents.append({"role": "model", "parts": [part]})
 
             if tool_id is not None and str(tool_id) in tool_results:
-                new_contents.append({"role": "user", "parts": [tool_results[str(tool_id)]]})
+                # 实抓 2.34.0：functionResponse 的 role=model（非 user）
+                new_contents.append({"role": "model", "parts": [tool_results[str(tool_id)]]})
 
             i += 1
             continue
