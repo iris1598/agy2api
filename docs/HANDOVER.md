@@ -749,3 +749,72 @@ labels/step/header/TLS，从未校验 user 文本形态），发现并修复了�
 6. **凭证存储无缺口**：代理自建 OAuth 回调流（`src/auth.py`），
    client_id/secret 与二进制逐字节一致（§10.13 补记），无需解析客户端
    本地令牌存储。
+
+### 10.16 第十一轮：三大增强落地（owner 点单"把增强全做了"）
+
+#### 增强 2：注册表全字段学习（消挂账二 maxOutputTokens）
+
+活注册表（163547/0004）暴露的偏差全集：claude 5.5 系 128000（代理给
+64000）、gemini-2.5 系 65535（代理给 65536）、**neon 系 262144**（代理按
+hydrogen 前缀漏配 65536）、**gemini-4-hydrogen-sonar 65536**（被 hydrogen
+前缀误配 262144）、gpt-oss 32768（代理给 65536）。根因：`parse_model_params`
+学习器早已存在，但**默认值注入没接它**（用静态家族常量）。本轮：
+
+1. `src/model_enum.py`：`_PARAM_KEYS` 扩容至 8 键
+   （+thinkingLevel/supportsImages/disabled/beta/maxTokens）；**标量键顶层
+   直取**（modelExperiments 嵌套有同名键，深搜会误命中），原三键保留深搜
+   回退。新增 `parse_model_quota`（每模型 quotaInfo：remainingFraction +
+   resetTime）。
+2. `src/converter/antigravity_fix.py`：默认注入改为 `get_model_param(model,
+   "maxOutputTokens")` 优先、家族常量降级为学习前回落——上述偏差**全部
+   自动消失**（每凭证首次 fetchAvailableModels 后生效）。附带收获：xhigh
+   模型注册表 `thinkingLevel: 100`——实抓数值 100 的最终出处就是注册表
+   字段（1/2/3/100），`_thinking_level_from_model` 从实抓孤证升级为
+   注册表级证据。
+3. `src/fidelity.py`：`_thinking_level_from_model` 注册表学习值优先
+   （`_REGISTRY_LEVEL_WIRE`：1→"LOW"/2→"MEDIUM"/3→"HIGH"/100→100，
+   4/5/6/7 线格式无实抓证据不映射）；`validate_client_request` 新增
+   `disabled=True` 模型 fail-closed 拒绝（实抓：gemini-4-carbon-disabled）；
+   `_PROXY_DEFAULT_MAX_OUTPUT` 豁免保留但语义变更为"学习并发竞态防御"
+   （正常路径注入值=上限值，豁免不再日常触发）。
+4. `src/quota_budget.py`：新增每模型额度状态（`set_model_quota`，按
+   email 隔离——额度是凭证粒度不是全局粒度）；耗尽判定改为
+   `min(配额桶, 每模型 quotaInfo)` 两路信号取小，fail-open 语义不变。
+   数据来源：`fetch_credential_models` 加可选 `email` 参数顺带解析
+   （`refresh_credential_models` 传入），**零额外请求**。
+
+#### 增强 1：countTokens 真实计数
+
+- `src/api/antigravity.py` 新增 `fetch_upstream_token_count`：按 proto
+  schema（`CountTokensRequest{request: master.CountTokensRequest{contents,
+  systemInstruction, tools}}`，响应 `{totalTokens}`）构造请求体，同一 Go
+  转发器出站、同一 header 家族；无 contents 直接 None（不选凭证）。
+- 两个既有端点从本地启发式估算升级：`/v1/messages/count_tokens`
+  （anthropic 路由：payload → ClaudeRequest → anthropic2gemini →
+  normalize 后送上游）与 `:countTokens`（gemini 路由，兼容
+  `generateContentRequest` batch 形态）。上游失败回落本地估算并告警
+  （工具型端点，不做静默降级学究化）；`COUNT_TOKENS_UPSTREAM=false`
+  可整体关闭。真实计数不消耗模型额度（预检类，P0 复核）。
+
+#### 增强 3：串行回合锁按凭证下沉（P2.4）
+
+- `src/request_pacer.py`：新增 `acquire_turn_for(key)` / `release_turn_for(key)`
+  / `turn_locked_for` / `reset_keyed_turns`（keyed 状态 FIFO 上限 4096，
+  跨事件循环 RuntimeError 自动重建锁保留串行计时）；全局
+  `acquire_turn`/`release_turn` 保留为遗留兼容（测试/外部调用方）。
+- `src/api/antigravity.py`：`_stream_with_credential_slot` 与非流式
+  post 路径在 `credential_limiter.acquire` 之后按凭证取回合
+  （释放顺序：先并发名额、后回合锁，与中间件约定一致）；重试换凭证
+  天然取新凭证的回合。
+- `src/rate_limiter.py` 中间件卸载全局回合锁（保留并发名额 + 滑动窗口），
+  移除 request_pacer 依赖。**语义修正**：真实客户端的串行是"每个客户端
+  实例内串行"——旧全局锁让一个账号的慢请求阻塞所有账号（画像偏差 +
+  吞吐损失双重伤害）。
+- 测试适配：`test_serial_mode_deadlock.py`（3 个中间件串行测试改写为
+  按键语义 + 新增跨 key 并行回归）、`test_serial_mode_asgi_integration.py`
+  （重写：ASGI 层验证并发名额归还 + pacer 层验证按键取消安全/串行/并行）、
+  `test_body_read_timeout.py`（回合锁断言改为并发名额）。
+
+**测试**：**pytest 258 passed**（+13：注册表解析/每模型额度/thinkingLevel
+映射/disabled 拒绝/countTokens helper 四类）；`verify --envelope --json`
+全绿。`.env.example` 登记 `COUNT_TOKENS_UPSTREAM`。

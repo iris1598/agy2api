@@ -21,7 +21,6 @@ from config import (
     get_request_body_timeout,
 )
 from log import log
-from src.request_pacer import request_pacer
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
@@ -154,24 +153,15 @@ class RateLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        turn_held = False
         rate_held = False
-        released_turn = False
         released_rate = False
         # 请求体阶段结束的标志：读完整（more_body=False）、感知到断开、或响应已开始。
         # 超时保护只覆盖请求体阶段；响应阶段 receive 的语义完全不同（断开探测）。
         body_phase_done = False
         response_started = False
 
-        def release_turn_once():
-            """同步归还回合锁：不包含 await，因此在被取消的清理路径上也一定会执行。"""
-            nonlocal released_turn
-            if turn_held and not released_turn:
-                released_turn = True
-                request_pacer.release_turn()
-
         def release_rate_once():
-            """同步归还并发名额：理由同 release_turn_once。"""
+            """同步归还并发名额：不包含 await，因此在被取消的清理路径上也一定会执行。"""
             nonlocal released_rate
             if rate_held and not released_rate:
                 released_rate = True
@@ -187,9 +177,7 @@ class RateLimitMiddleware:
             await send(message)
             # 响应体发送完成后释放（包含流式响应的最后一帧）
             if message["type"] == "http.response.body" and not message.get("more_body"):
-                # 先释放并发名额，再释放回合：避免下个排队请求醒来时并发仍满
                 release_rate_once()
-                release_turn_once()
 
         # 入站请求体分块读超时（默认 30s，0=禁用）：语义等价于 nginx 的
         # client_body_timeout——只要请求体还在陆续到达就不断重置计时，
@@ -221,10 +209,10 @@ class RateLimitMiddleware:
             return message
 
         try:
-            # 1. 串行模式排队：整个流程都在 try 保护之下，任何异常/取消都不会泄漏回合锁
-            turn_held = await request_pacer.acquire_turn()
-
-            # 2. 并发/速率检查
+            # 1. 并发/速率检查。串行回合锁已下沉到 API 层按凭证取用
+            #    （src/api/antigravity.py，§10.16 增强三）：串行语义是"每个
+            #    客户端实例内串行"，全局回合锁会让一个账号的慢请求阻塞所有
+            #    账号。中间件保留并发名额与滑动窗口这两类代理级自保。
             if not await rate_limiter.acquire():
                 await self._send_429(send)
                 return
@@ -241,12 +229,9 @@ class RateLimitMiddleware:
                 else:  # pragma: no cover - 防御路径：响应已开始时不可再发响应头
                     raise
         finally:
-            # 兜底释放：客户端断开、任务被取消或任何未捕获异常都不能让名额/回合锁泄漏。
-            # 两个释放动作都是同步的（没有 await 点），因此清理过程不可能被取消打断。
-            try:
-                release_rate_once()
-            finally:
-                release_turn_once()
+            # 兜底释放：客户端断开、任务被取消或任何未捕获异常都不能让并发名额泄漏。
+            # 释放动作是同步的（没有 await 点），因此清理过程不可能被取消打断。
+            release_rate_once()
 
     async def _send_429(self, send):
         body = json.dumps(

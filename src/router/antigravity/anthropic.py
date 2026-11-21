@@ -43,7 +43,8 @@ from src.models import ClaudeRequest, model_to_dict
 from src.token_estimator import estimate_input_tokens
 
 # 本地模块 - API 层
-from src.api.antigravity import non_stream_request, stream_request
+from src.api.antigravity import fetch_upstream_token_count, non_stream_request, stream_request
+from config import get_count_tokens_upstream
 
 # 本地模块 - 转换器
 from src.converter.anthropic2gemini import (
@@ -339,11 +340,32 @@ async def count_tokens(
         f"thinking_present={thinking_present}, thinking={thinking_summary}, ua={user_agent}"
     )
 
-    # 简单估算
+    # 真实上游计数（fetchAvailableModels 学习值已就绪的凭证）；失败回落本地估算。
+    # 工具型端点，不影响 agent 路径保真度；可经 COUNT_TOKENS_UPSTREAM=false 关闭。
     input_tokens = 0
+    used_upstream = False
     try:
-        input_tokens = estimate_input_tokens(payload)
+        normalized_dict = model_to_dict(ClaudeRequest(**payload))
+        gemini_dict = await anthropic_to_gemini_request(normalized_dict)
+        gemini_dict = await normalize_antigravity_request(gemini_dict)
+        if await get_count_tokens_upstream():
+            upstream_count = await fetch_upstream_token_count(
+                gemini_dict, str(payload.get("model") or "")
+            )
+            if upstream_count is not None:
+                input_tokens = upstream_count
+                used_upstream = True
     except Exception as e:
-        log.error(f"[ANTIGRAVITY-ANTHROPIC] token 估算失败: {e}")
+        log.warning(f"[ANTIGRAVITY-ANTHROPIC] count_tokens 上游计数失败，回落估算: {e}")
+    if not used_upstream:
+        try:
+            input_tokens = estimate_input_tokens(payload)
+        except Exception as e:
+            log.error(f"[ANTIGRAVITY-ANTHROPIC] token 估算失败: {e}")
+
+    log.info(
+        f"[ANTIGRAVITY-ANTHROPIC] /messages/count_tokens 完成: "
+        f"input_tokens={input_tokens}, source={'upstream' if used_upstream else 'estimate'}"
+    )
 
     return JSONResponse(content={"input_tokens": input_tokens})

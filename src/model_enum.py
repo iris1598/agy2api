@@ -69,7 +69,20 @@ MODEL_PARAMS: Dict[str, Dict[str, Any]] = {
 }
 
 # fetchAvailableModels 响应里关注的参数键；缺失的键不记录。
-_PARAM_KEYS = ("maxOutputTokens", "supportsThinking", "minThinkingBudget")
+# thinkingLevel 是注册表的档位数值（实抓 163547/0004：low=1/medium=2/high=3/
+# xhigh=100）——真实客户端请求里的 thinkingLevel 就来自这个字段；
+# disabled=True 的模型（实抓：gemini-4-carbon-disabled）应被 fail-closed 拒绝。
+# 标量键优先取条目顶层（modelExperiments 嵌套里有同名键，深搜会误命中）。
+_PARAM_KEYS = (
+    "maxOutputTokens",
+    "supportsThinking",
+    "minThinkingBudget",
+    "thinkingLevel",
+    "supportsImages",
+    "disabled",
+    "beta",
+    "maxTokens",
+)
 
 # 进程内学习到的映射（fetchAvailableModels 探测时刷新，覆盖内置表）
 _LEARNED_ENUM_MAP: Dict[str, str] = {}
@@ -182,12 +195,53 @@ def parse_model_params(data: Any) -> Dict[str, Dict[str, Any]]:
             continue
         found: Dict[str, Any] = {}
         for key in _PARAM_KEYS:
-            value = _find_value(info, key)
+            # 顶层直取优先（避免 modelExperiments 嵌套同名键误命中）；
+            # 原有三键保留深搜回退，兼容未固化的响应形状
+            value = info.get(key)
+            if value is None and key in ("maxOutputTokens", "supportsThinking", "minThinkingBudget"):
+                value = _find_value(info, key)
             if value is not None:
                 found[key] = value
         if found:
             params[str(model_id)] = found
     return params
+
+
+def parse_model_quota(data: Any) -> Dict[str, Dict[str, Any]]:
+    """从 ``fetchAvailableModels`` 响应中提取每模型额度（每凭证粒度）。
+
+    实抓 163547/0004：每个模型条目带 ``quotaInfo``:
+    ``{"remainingFraction": 0.98, "resetTime": "2026-11-21T13:36:03Z"}``。
+    额度是**按凭证**的（不同账号不同值），不能并入全局 MODEL_PARAMS，
+    仅供 quota_budget 按 email 存放。
+    """
+    if not isinstance(data, dict):
+        return {}
+    models = data.get("models")
+    items: list = []
+    if isinstance(models, dict):
+        items = list(models.items())
+    elif isinstance(models, list):
+        for entry in models:
+            if isinstance(entry, dict):
+                items.append((str(entry.get("id") or entry.get("name") or ""), entry))
+
+    quota: Dict[str, Dict[str, Any]] = {}
+    for model_id, info in items:
+        if not model_id or not isinstance(info, dict):
+            continue
+        qi = info.get("quotaInfo")
+        if not isinstance(qi, dict):
+            continue
+        fraction = qi.get("remainingFraction")
+        if not isinstance(fraction, (int, float)) or isinstance(fraction, bool):
+            continue
+        entry: Dict[str, Any] = {"remainingFraction": float(fraction)}
+        reset_time = qi.get("resetTime")
+        if isinstance(reset_time, str):
+            entry["resetTime"] = reset_time
+        quota[str(model_id)] = entry
+    return quota
 
 
 def merge_model_params(mapping: Optional[Dict[str, Dict[str, Any]]]) -> None:

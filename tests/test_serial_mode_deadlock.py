@@ -48,6 +48,7 @@ def _force_clean() -> None:
     pacer = request_pacer
     pacer._lock = asyncio.Lock()
     pacer._turn_lock = asyncio.Lock()
+    pacer.reset_keyed_turns()
     pacer._last_finished = None
     pacer._last_sent = None
     pacer._last_refresh = time.monotonic()
@@ -292,7 +293,8 @@ def test_app_exception_releases_turn_and_slot() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 正向功能：串行模式严格排队，请求之间不重叠
+# 正向功能（§10.16 增强三）：同一凭证（key）的串行回合严格排队，不重叠。
+# 中间件不再提供全局串行（回合锁已按凭证下沉到 API 层）。
 # ---------------------------------------------------------------------------
 async def _case_serial_requests_do_not_overlap() -> None:
     _force_clean()
@@ -302,27 +304,25 @@ async def _case_serial_requests_do_not_overlap() -> None:
     running = 0
     max_running = 0
 
-    async def app(scope, receive, send):
+    async def worker():
         nonlocal running, max_running
-        running += 1
-        max_running = max(max_running, running)
-        events.append("enter")
-        await asyncio.sleep(0.1)
-        await send({"type": "http.response.start", "status": 200, "headers": []})
-        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
-        events.append("exit")
-        running -= 1
+        held = await request_pacer.acquire_turn_for("cred-a")
+        assert held is True
+        try:
+            running += 1
+            max_running = max(max_running, running)
+            events.append("enter")
+            await asyncio.sleep(0.1)
+            events.append("exit")
+        finally:
+            request_pacer.release_turn_for("cred-a")
+            running -= 1
 
-    middleware = RateLimitMiddleware(app)
-    await asyncio.gather(
-        middleware(dict(SCOPE), None, lambda message: asyncio.sleep(0)),
-        middleware(dict(SCOPE), None, lambda message: asyncio.sleep(0)),
-        middleware(dict(SCOPE), None, lambda message: asyncio.sleep(0)),
-    )
+    await asyncio.gather(*(worker() for _ in range(3)))
 
-    assert max_running == 1, f"串行模式下不应重叠执行，实际最大并发 {max_running}"
+    assert max_running == 1, f"同一凭证串行模式下不应重叠执行，实际最大并发 {max_running}"
     assert events == ["enter", "exit"] * 3, f"排队顺序异常: {events}"
-    assert request_pacer._turn_lock.locked() is False, "全部请求结束后回合锁应释放"
+    assert request_pacer.turn_locked_for("cred-a") is False, "全部请求结束后回合锁应释放"
 
 
 def test_serial_requests_do_not_overlap() -> None:
@@ -352,42 +352,39 @@ def test_normal_request_releases_resources() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 正向功能：串行开关独立生效（只勾「串行模式」、不勾「请求节流」也应排队）
+# 正向功能（§10.16 增强三）：串行回合锁已下沉为按键（按凭证）版本——
+# 串行语义 = 每个客户端实例（凭证）内串行，跨凭证不互相阻塞。
+# 以下测试直接针对 ``acquire_turn_for`` / ``release_turn_for``。
 # ---------------------------------------------------------------------------
-async def _run_concurrent_requests(count: int):
-    events = []
+async def _run_keyed_concurrent(count: int, *, same_key: bool) -> int:
     running = 0
     max_running = 0
 
-    async def app(scope, receive, send):
+    async def worker(key: str):
         nonlocal running, max_running
-        running += 1
-        max_running = max(max_running, running)
-        events.append("enter")
-        await asyncio.sleep(0.05)
-        await send({"type": "http.response.start", "status": 200, "headers": []})
-        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
-        events.append("exit")
-        running -= 1
+        held = await request_pacer.acquire_turn_for(key)
+        try:
+            running += 1
+            max_running = max(max_running, running)
+            await asyncio.sleep(0.05)
+        finally:
+            running -= 1
+            if held:
+                request_pacer.release_turn_for(key)
 
-    middleware = RateLimitMiddleware(app)
-    await asyncio.gather(
-        *(
-            middleware(dict(SCOPE), None, lambda message: asyncio.sleep(0))
-            for _ in range(count)
-        )
-    )
-    return events, max_running
+    keys = (["cred-a"] * count) if same_key else [f"cred-{i}" for i in range(count)]
+    await asyncio.gather(*(worker(k) for k in keys))
+    return max_running
 
 
 async def _case_serial_without_throttle_switch() -> None:
+    """串行开关独立生效（只勾「串行模式」）：同一凭证的并发请求不重叠。"""
     _force_clean()
     await _enable_serial(min_interval=0.0, jitter=0.0)
     request_pacer._enabled = False  # 只开串行模式，关掉请求节流总开关
 
-    events, max_running = await _run_concurrent_requests(2)
-    assert max_running == 1, "串行开关应独立生效，不应依赖请求节流总开关"
-    assert events == ["enter", "exit"] * 2, f"排队顺序异常: {events}"
+    max_running = await _run_keyed_concurrent(2, same_key=True)
+    assert max_running == 1, f"同一凭证串行不重叠，实际最大并发 {max_running}"
 
 
 def test_serial_mode_works_without_throttle_switch() -> None:
@@ -399,12 +396,25 @@ async def _case_parallel_when_serial_off() -> None:
     await _enable_serial(min_interval=0.0, jitter=0.0)
     request_pacer._serial_mode = False  # 关闭串行 → 应恢复并发
 
-    _, max_running = await _run_concurrent_requests(2)
+    max_running = await _run_keyed_concurrent(2, same_key=True)
     assert max_running == 2, "关闭串行模式后请求应可并发，不应被排队"
 
 
 def test_requests_run_in_parallel_when_serial_disabled() -> None:
     asyncio.run(_case_parallel_when_serial_off())
+
+
+async def _case_different_keys_run_parallel() -> None:
+    """不同凭证（不同 key）互不阻塞——全局回合锁旧语义的关键差异。"""
+    _force_clean()
+    await _enable_serial(min_interval=0.0, jitter=0.0)
+
+    max_running = await _run_keyed_concurrent(2, same_key=False)
+    assert max_running == 2, f"不同凭证应可并行，实际最大并发 {max_running}"
+
+
+def test_different_keys_run_parallel_in_serial_mode() -> None:
+    asyncio.run(_case_different_keys_run_parallel())
 
 
 def main() -> int:

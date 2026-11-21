@@ -52,8 +52,9 @@ DEFAULT_SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_JAILBREAK", "threshold": "OFF"},
 ]
 
-# 官方模型目录权威 maxOutputTokens：Claude 严禁超 64k；Gemini 家族 65536；
-# hydrogen 系（gemini-4-hydrogen-*，实抓 163547/193455）统一 262144
+# 家族兜底常量（注册表学习值缺失时的回落；正常路径默认值来自
+# get_model_param("maxOutputTokens") 学习值，per-model 精确，§10.16）：
+# Claude 64000、Gemini 家族 65536、hydrogen 前缀 262144（实抓 163547/193455）
 CLAUDE_MAX_OUTPUT_TOKENS = 64000
 GEMINI_MAX_OUTPUT_TOKENS = 65536
 HYDROGEN_MAX_OUTPUT_TOKENS = 262144
@@ -1023,10 +1024,15 @@ async def _normalize_generation_config(
                 thinking_config["thinkingBudget"] = CLAUDE_MIN_THINKING_BUDGET
 
     # 官方标配 maxOutputTokens（在 thinkingConfig 剔除/钳制之后补齐）：
-    # Claude 64000（严禁超 64k），hydrogen 系 262144（实抓 163547/193455：
-    # medium 与 xhigh 统一 262144），其余 Gemini 家族 65536
+    # 注册表学习值优先（fetchAvailableModels 实抓 per-model 精确值：claude 5.5
+    # 系 128000 / hydrogen+neon+carbon 系 262144 / gemini-2.5 系 65535 /
+    # gemini-3.x+3.8+argon 系 65536 / gpt-oss 32768），学习前回落家族常量
+    # （Claude 64000、hydrogen 前缀 262144、其余 Gemini 65536）。
     is_claude_model = is_claude or "claude" in (upstream or "").lower()
-    if is_claude_model:
+    learned_max = get_model_param(upstream, "maxOutputTokens")
+    if isinstance(learned_max, int) and not isinstance(learned_max, bool):
+        default_max_output = learned_max
+    elif is_claude_model:
         default_max_output = CLAUDE_MAX_OUTPUT_TOKENS
     elif (upstream or "").lower().startswith("gemini-4-hydrogen"):
         default_max_output = HYDROGEN_MAX_OUTPUT_TOKENS

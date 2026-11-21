@@ -1,10 +1,9 @@
 """入站请求体读超时（REQUEST_BODY_TIMEOUT）端到端验证。
 
 场景：客户端在网络波动中迟迟传不完请求体，且 FIN/RST 到不了服务器——
-服务端既收不到 http.disconnect，也没有任何取消信号。此前的串行模式会让
-回合锁被半截请求永久占用，后续所有聊天请求死锁在 acquire_turn 上，
-只能重启进程；现有测试用 task.cancel() 模拟断开（取消信号能进入服务端
-任务），恰好不覆盖「服务端永远感知不到」这条路径。
+服务端既收不到 http.disconnect，也没有任何取消信号。半截请求会占住中间件
+的并发名额（§10.16 增强三后串行回合锁已按凭证下沉到 API 层，中间件只持有
+并发名额），泄漏同样会让后续请求被 429 卡死。
 
 这里用原始 ASGI 调用真实的 RateLimitMiddleware + FastAPI 应用，
 用「永远挂起的 receive」模拟服务端感知不到的半途失联，验证：
@@ -32,7 +31,6 @@ from fastapi import FastAPI  # noqa: E402
 
 import src.rate_limiter as rl_module  # noqa: E402
 from src.rate_limiter import RateLimitMiddleware, rate_limiter  # noqa: E402
-from src.request_pacer import request_pacer  # noqa: E402
 
 
 def _make_app() -> FastAPI:
@@ -47,19 +45,11 @@ def _make_app() -> FastAPI:
 
 
 def _force_serial_mode() -> None:
-    """开启串行模式 + 限流（高并发上限），并把节流时钟归零。
+    """开启限流（高并发上限）并把时钟归零（§10.16 后中间件不再持有回合锁）。
 
     直接置内部状态而不是走配置系统，避免测试依赖数据库；
     _last_refresh 置为当前时刻，防止测试期间触发 _maybe_refresh 重读配置。
     """
-    request_pacer._enabled = True
-    request_pacer._serial_mode = True
-    request_pacer._min_interval = 0.0
-    request_pacer._jitter = 0.0
-    request_pacer._last_finished = None
-    request_pacer._last_sent = None
-    request_pacer._last_refresh = time.monotonic()
-
     rate_limiter._lock = asyncio.Lock()
     rate_limiter._enabled = True
     rate_limiter._max_concurrent = 5
@@ -156,7 +146,6 @@ def test_body_stall_returns_408_and_releases_resources():
         body = json.loads(messages[-1]["body"])
         assert "detail" in body, body
 
-        assert request_pacer._turn_lock.locked() is False, "超时后回合锁必须归还"
         assert rate_limiter._active == 0, "超时后并发名额必须归还"
 
         # 2. 后续请求必须能正常拿到完整响应（旧代码会死锁在 acquire_turn 上）
@@ -165,7 +154,6 @@ def test_body_stall_returns_408_and_releases_resources():
             app, _chunked_receive([full_body], [0.01])
         )
         assert normal_messages[0]["status"] == 200, normal_messages
-        assert request_pacer._turn_lock.locked() is False
         assert rate_limiter._active == 0
 
     asyncio.run(case())
@@ -185,7 +173,6 @@ def test_progressing_body_is_not_aborted():
         messages = await _run_and_collect(app, _chunked_receive(chunks, delays))
 
         assert messages[0]["status"] == 200, messages
-        assert request_pacer._turn_lock.locked() is False
         assert rate_limiter._active == 0
 
     asyncio.run(case())
@@ -206,13 +193,12 @@ def test_body_timeout_disabled_with_zero():
         await asyncio.sleep(0.4)
 
         assert task.done() is False, "禁用后不应有超时保护"
-        assert request_pacer._turn_lock.locked() is True, "禁用后回合锁仍被持有（旧行为）"
+        assert rate_limiter._active == 1, "禁用后并发名额仍被持有"
 
         # 取消任务（服务停止等场景）：清理路径必须照常归还锁与名额
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        assert request_pacer._turn_lock.locked() is False, "取消后回合锁必须归还"
         assert rate_limiter._active == 0, "取消后并发名额必须归还"
 
     asyncio.run(case())
@@ -233,7 +219,6 @@ def test_normal_full_body_request_unaffected():
 
         assert messages[0]["status"] == 200, messages
         assert b'"a"' in messages[-1]["body"], messages[-1]
-        assert request_pacer._turn_lock.locked() is False
         assert rate_limiter._active == 0
 
     asyncio.run(case())

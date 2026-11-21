@@ -55,24 +55,32 @@ class FidelityError(Exception):
         }
 
 
-# antigravity_fix 的官方标配 maxOutputTokens 默认值（客户端未指定或指定 64k 档
-# 时统一替换）。这是代理自身注入的标准值而非客户端意图，不参与上限拒绝；
-# 否则实抓 metadata 上限 65535（如 gemini-2.5-flash）会误杀默认请求。
+# antigravity_fix 的官方标配 maxOutputTokens 家族兜底值（学习值缺失时的回落，
+# 客户端未指定或指定 64k 档时统一替换）。豁免这两个值不参与上限拒绝：
+# 正常情况下注入值已与注册表上限一致（§10.16 学习值接入注入点），豁免只剩
+# 一个防御作用——学习并发竞态（注入时无学习值、校验时恰好合并进上限）下
+# 不误杀兜底默认请求。
 _PROXY_DEFAULT_MAX_OUTPUT = (65536, 64000)
+
+# 注册表 thinkingLevel 数值 → agent 路径线格式。实抓证据链：
+# 注册表 thinkingLevel=2（hydrogen-medium）→ 线格式 "MEDIUM"（163547/0013）；
+# 注册表 1 → "LOW"（flash-lite checkpoint 193455/0011）；注册表 100 → 数值 100
+# （193455/0012）。4/5/6/7 的线格式无实抓证据，不映射（无证据不注入）。
+_REGISTRY_LEVEL_WIRE = {1: "LOW", 2: "MEDIUM", 3: "HIGH", 100: 100}
 
 
 def _thinking_level_from_model(model: str):
-    """按模型名解析官方 thinkingLevel 字面值（返回值即注入的 JSON 值）。
+    """按模型解析官方 thinkingLevel 线格式（返回值即注入的 JSON 值）。
 
-    实抓（163547/193455 真实转发会话）：
-    - ``gemini-4-*-low|medium|high`` → 字符串 ``"LOW"/"MEDIUM"/"HIGH"``；
-    - ``gemini-4-hydrogen-xhigh``（extra high 档位）→ **数值 ``100``**，
-      不是字符串（193455/0012：``"thinkingLevel": 100``，maxOutputTokens
-      262144，model_enum M528）；
-    - MINIMAL/"LOW"（flash-lite）只出现在 agent_monitoring/checkpoint 心跳
-      请求上，agent 聊天路径 0 条；本代理只发 agent 请求，不应注入/接受。
-    返回 None 表示该模型无实抓档位证据，不校验不注入。
+    优先级：注册表学习值（fetchAvailableModels 的 thinkingLevel 字段经
+    _REGISTRY_LEVEL_WIRE 映射）→ 模型名后缀（-low/-medium/-high → 字符串、
+    -xhigh → 数值 100）。两者都无证据返回 None（不校验不注入）。
     """
+    learned = get_model_param(model or "", "thinkingLevel")
+    if learned is not None and not isinstance(learned, bool):
+        wire = _REGISTRY_LEVEL_WIRE.get(learned)
+        if wire is not None:
+            return wire
     lowered = (model or "").lower()
     if lowered.endswith("-xhigh"):
         return 100
@@ -163,6 +171,14 @@ def validate_client_request(request: Dict[str, Any], model: str) -> None:
         raise FidelityError(
             "unknown_model_enum",
             f"模型 {model} 没有 MODEL_PLACEHOLDER 映射；先抓包并更新 src/model_enum.py",
+        )
+
+    # 注册表标记 disabled 的模型（实抓：gemini-4-carbon-disabled）直接拒绝，
+    # 宁可报错不发出一个真实客户端根本不可用的请求（fail-closed）。
+    if model and get_model_param(model, "disabled") is True:
+        raise FidelityError(
+            "model_disabled",
+            f"模型 {model} 在上游 fetchAvailableModels 注册表中标记为 disabled",
         )
 
     _validate_generation_config(request, model)

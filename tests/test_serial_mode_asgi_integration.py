@@ -1,8 +1,14 @@
-"""端到端（ASGI 层）验证：串行模式 + 限流中间件在「客户端中途取消」后不再卡死。
+"""端到端（ASGI 层 + pacer 层）验证：§10.16 增强三后的串行语义。
 
-用 ``httpx.ASGITransport`` 把真实的 ``RateLimitMiddleware`` 挂到真实的 FastAPI 应用上，
-并取消客户端任务来模拟「用户点停止生成 / 刷新页面 / 客户端超时断开」。
-取消会以 ``asyncio.CancelledError`` 形式穿过中间件，正是此前泄漏回合锁的场景。
+中间件不再持有全局串行回合锁（并发名额 + 滑动窗口仍在中间件）；
+串行回合锁按凭证下沉到 API 层（``_stream_with_credential_slot`` /
+``acquire_turn_for``）。本文件验证两件事：
+
+1. **pacer 层**：按键回合锁在「客户端中途取消」后不泄漏——取消会以
+   ``asyncio.CancelledError`` 形式穿过等待，正是此前泄漏全局回合锁的场景；
+   同 key 严格串行、跨 key 并行。
+2. **ASGI 层**：中间件只管并发名额——客户端取消后名额归还、后续请求正常，
+   串行不再由中间件提供。
 
 用法::
 
@@ -55,6 +61,7 @@ def _force_clean(min_interval: float) -> None:
     request_pacer._last_finished = None
     request_pacer._last_sent = None
     request_pacer._last_refresh = time.monotonic()
+    request_pacer.reset_keyed_turns()
 
     rate_limiter._lock = asyncio.Lock()
     rate_limiter._enabled = False
@@ -78,32 +85,97 @@ async def _cancel_after(client, delay: float) -> None:
     await asyncio.sleep(0.05)
 
 
-async def _case_client_cancel_then_next_request_succeeds() -> None:
+async def _case_client_cancel_releases_rate_slot() -> None:
+    """ASGI 层：客户端中途取消 → 并发名额归还 → 后续请求正常。"""
     _force_clean(min_interval=0.3)
+    rate_limiter._enabled = True
+    rate_limiter._max_concurrent = 1
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # 1. 流式响应进行到一半时取消（回合锁与并发名额都在持有中）
+        # 1. 流式响应进行到一半时取消（并发名额在持有中）
         await _cancel_after(client, 0.05)
-        assert request_pacer._turn_lock.locked() is False, (
-            "客户端取消后回合锁应已归还（旧代码会永久 locked）"
-        )
+        assert rate_limiter._active == 0, "客户端取消后并发名额应已归还"
 
-        # 2. 在 acquire_turn() 等待最小间隔/抖动期间取消（旧代码泄漏锁的另一个窗口）
-        await _cancel_after(client, 0.02)
-
-        # 3. 后续请求必须能正常拿到完整响应
+        # 2. 后续请求必须能正常拿到完整响应（名额泄漏时会 429/挂死）
         response = await asyncio.wait_for(
             client.post("/v1/chat/completions", json={}), timeout=3.0
         )
         assert response.status_code == 200, response.status_code
         assert response.text.count("data:") == STREAM_CHUNKS
 
-    assert request_pacer._turn_lock.locked() is False, "全部请求结束后回合锁应释放"
-    assert rate_limiter._active == 0, "并发名额应归零"
+    assert rate_limiter._active == 0, "全部请求结束后并发名额应归零"
 
 
 def test_client_cancel_then_next_request_succeeds() -> None:
-    asyncio.run(_case_client_cancel_then_next_request_succeeds())
+    asyncio.run(_case_client_cancel_releases_rate_slot())
+
+
+# ---------------------------------------------------------------------------
+# pacer 层：按键回合锁的取消安全（旧全局回合锁泄漏场景的按键版回归）
+# ---------------------------------------------------------------------------
+async def _case_keyed_turn_cancel_then_next_succeeds() -> None:
+    _force_clean(min_interval=0.3)
+
+    # 0. 先完成一次完整回合，给 "cred-a" 种下 last_finished（下一条请求会
+    #    等待 min_interval=0.3s，制造「等待期间被取消」的窗口）
+    held = await request_pacer.acquire_turn_for("cred-a")
+    assert held is True
+    request_pacer.release_turn_for("cred-a")
+
+    # 1. 在等待最小间隔期间取消（sleep 中的 CancelledError）
+    task = asyncio.create_task(request_pacer.acquire_turn_for("cred-a"))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    await asyncio.sleep(0.02)
+    assert request_pacer.turn_locked_for("cred-a") is False, (
+        "等待期间取消后按键回合锁应已归还（不更新 last_finished）"
+    )
+
+    # 2. 持有回合后正常释放，下一请求立即拿到
+    held = await request_pacer.acquire_turn_for("cred-a")
+    assert held is True
+    request_pacer.release_turn_for("cred-a")
+    held = await request_pacer.acquire_turn_for("cred-a")
+    assert held is True
+    request_pacer.release_turn_for("cred-a")
+    assert request_pacer.turn_locked_for("cred-a") is False
+
+
+def test_keyed_turn_cancel_then_next_succeeds() -> None:
+    asyncio.run(_case_keyed_turn_cancel_then_next_succeeds())
+
+
+async def _case_keyed_turn_serial_and_parallel() -> None:
+    _force_clean(min_interval=0.0)
+
+    async def worker(key: str, state: dict):
+        held = await request_pacer.acquire_turn_for(key)
+        try:
+            state["running"] += 1
+            state["max"] = max(state["max"], state["running"])
+            await asyncio.sleep(0.05)
+        finally:
+            state["running"] -= 1
+            if held:
+                request_pacer.release_turn_for(key)
+
+    # 同 key 串行
+    state = {"running": 0, "max": 0}
+    await asyncio.gather(worker("cred-a", state), worker("cred-a", state))
+    assert state["max"] == 1, f"同 key 串行，实际最大并发 {state['max']}"
+
+    # 跨 key 并行
+    state = {"running": 0, "max": 0}
+    await asyncio.gather(worker("cred-a", state), worker("cred-b", state))
+    assert state["max"] == 2, f"跨 key 并行，实际最大并发 {state['max']}"
+
+
+def test_keyed_turn_serial_and_parallel() -> None:
+    asyncio.run(_case_keyed_turn_serial_and_parallel())
 
 
 def main() -> int:

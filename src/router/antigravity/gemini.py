@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
 # 本地模块 - 配置和日志
-from config import get_anti_truncation_max_attempts
+from config import get_anti_truncation_max_attempts, get_count_tokens_upstream
 from log import log
 
 # 本地模块 - 工具和认证
@@ -49,7 +49,7 @@ from src.converter.policy_block import (
 from src.models import GeminiRequest, model_to_dict
 
 # 本地模块 - API 层
-from src.api.antigravity import non_stream_request, stream_request
+from src.api.antigravity import fetch_upstream_token_count, non_stream_request, stream_request
 
 # 本地模块 - 转换器
 from src.converter.antigravity_fix import normalize_antigravity_request
@@ -367,9 +367,11 @@ async def count_tokens(
     api_key: str = Depends(authenticate_gemini_flexible),
 ):
     """
-    模拟Gemini格式的token计数
+    Gemini 格式 token 计数（§10.16 增强 1）。
 
-    使用简单的启发式方法：大约4字符=1token
+    优先走真实上游 /v1internal:countTokens（proto schema 还原请求体）；
+    上游失败或 COUNT_TOKENS_UPSTREAM=false 时回落本地字符估算（约 4 字符
+    = 1 token）。工具型端点，不影响 agent 路径保真度。
     """
 
     try:
@@ -382,29 +384,27 @@ async def count_tokens(
         log.error(f"Failed to parse JSON request: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
 
-    # 简单的token计数模拟 - 基于文本长度估算
-    total_tokens = 0
+    # 客户端体两种形态：{"contents": [...]} 直接计数，或
+    # {"generateContentRequest": {...}}（batchCountTokens 语义）
+    inner = request_data.get("generateContentRequest") or request_data
+    if not isinstance(inner, dict):
+        inner = {}
 
-    # 如果有contents字段
-    if "contents" in request_data:
-        for content in request_data["contents"]:
-            if "parts" in content:
-                for part in content["parts"]:
-                    if "text" in part:
-                        # 简单估算：大约4字符=1token
-                        text_length = len(part["text"])
-                        total_tokens += max(1, text_length // 4)
+    total_tokens = None
+    if await get_count_tokens_upstream():
+        try:
+            total_tokens = await fetch_upstream_token_count(inner, "")
+        except Exception as e:
+            log.warning(f"[ANTIGRAVITY-GEMINI] countTokens 上游计数异常，回落估算: {e}")
 
-    # 如果有generateContentRequest字段
-    elif "generateContentRequest" in request_data:
-        gen_request = request_data["generateContentRequest"]
-        if "contents" in gen_request:
-            for content in gen_request["contents"]:
-                if "parts" in content:
-                    for part in content["parts"]:
-                        if "text" in part:
-                            text_length = len(part["text"])
-                            total_tokens += max(1, text_length // 4)
+    if total_tokens is None:
+        # 本地估算回落：文本长度 / 4
+        total_tokens = 0
+        for content in inner.get("contents") or []:
+            if isinstance(content, dict):
+                for part in content.get("parts") or []:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        total_tokens += max(1, len(part["text"]) // 4)
 
     # 返回Gemini格式的响应
     return JSONResponse(content={"totalTokens": total_tokens})

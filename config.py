@@ -39,6 +39,7 @@ ENV_MAPPINGS = {
     "QUOTA_BUDGET_ENABLED": "quota_budget_enabled",
     "QUOTA_BUDGET_THRESHOLD": "quota_budget_threshold",
     "QUOTA_BUDGET_REFRESH_MINUTES": "quota_budget_refresh_minutes",
+    "COUNT_TOKENS_UPSTREAM": "count_tokens_upstream",
     "BACKOFF_ENABLED": "backoff_enabled",
     "BACKOFF_MAX_DELAY": "backoff_max_delay",
     "MODEL_MIX_ENABLED": "model_mix_enabled",
@@ -254,6 +255,24 @@ async def get_quota_budget_enabled() -> bool:
     if env_value:
         return env_value.lower() in ("true", "1", "yes", "on")
     return bool(await get_config_value("quota_budget_enabled", True))
+
+
+async def get_count_tokens_upstream() -> bool:
+    """count_tokens 端点走真实上游计数（默认开启）。
+
+    开启时 /v1/messages/count_tokens 与 :countTokens 先调用
+    /v1internal:countTokens 真实计数，上游失败回落本地估算（工具型端点，
+    不影响 agent 路径保真度）；关闭时直接使用本地估算。
+    真实计数会多一次上游调用（读取型，预计不消耗模型额度，P0 复核）。
+
+    Environment variable: COUNT_TOKENS_UPSTREAM
+    Database config key: count_tokens_upstream
+    Default: True
+    """
+    env_value = os.getenv("COUNT_TOKENS_UPSTREAM")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+    return bool(await get_config_value("count_tokens_upstream", True))
 
 
 async def get_quota_budget_threshold() -> float:

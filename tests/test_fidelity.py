@@ -259,8 +259,8 @@ class TestNonStrictClamp:
 
 
 class TestMaxOutputTokensDefaults:
-    """官方标配 maxOutputTokens 默认注入:hydrogen 系 262144(实抓 163547/193455),
-    其余 Gemini 家族 65536,Claude 64000。"""
+    """maxOutputTokens 默认注入:注册表学习值优先(§10.16),家族常量为
+    学习前回落(§10.13)。"""
 
     async def _default_for(self, monkeypatch, model: str) -> int:
         from src.converter import antigravity_fix
@@ -284,8 +284,13 @@ class TestMaxOutputTokensDefaults:
     async def test_hydrogen_xhigh_default_is_262144(self, monkeypatch):
         assert await self._default_for(monkeypatch, "gemini-4-hydrogen-xhigh") == 262144
 
-    async def test_other_gemini_default_is_65536(self, monkeypatch):
-        assert await self._default_for(monkeypatch, "gemini-2.5-flash") == 65536
+    async def test_gemini_25_flash_uses_registry_value(self, monkeypatch):
+        """内置种子表(实抓 metadata 65535)优先于家族兜底 65536(§10.16)。"""
+        assert await self._default_for(monkeypatch, "gemini-2.5-flash") == 65535
+
+    async def test_unknown_model_falls_back_to_family(self, monkeypatch):
+        """无学习值/种子值的模型回落家族常量。"""
+        assert await self._default_for(monkeypatch, "gemini-9.9-nonexistent") == 65536
 
 
 class TestThoughtSignatureCache:

@@ -68,9 +68,14 @@ async def refresh_all() -> Dict[str, int]:
             continue
 
         remaining = _min_remaining(quota.get("models", {}))
-        exhausted = remaining is not None and remaining <= threshold
+        # 每模型额度（fetchAvailableModels 的 quotaInfo，§10.16）：与配额桶
+        # 相互独立的两路信号，任一路低于阈值都算耗尽；无数据的路不参与。
+        model_remaining = _model_min_remaining(email)
+        candidates = [v for v in (remaining, model_remaining) if v is not None]
+        effective = min(candidates) if candidates else None
+        exhausted = effective is not None and effective <= threshold
         _state[email] = {
-            "min_remaining": remaining,
+            "min_remaining": effective,
             "checked_at": time.monotonic(),
             "exhausted": exhausted,
         }
@@ -78,7 +83,8 @@ async def refresh_all() -> Dict[str, int]:
             summary["exhausted"] += 1
             log.warning(
                 f"[QUOTA_BUDGET] 账号 {email} 额度接近耗尽"
-                f"（最小剩余 {remaining:.2%} ≤ 阈值 {threshold:.2%}），已从候选剔除"
+                f"（最小剩余 {effective:.2%} ≤ 阈值 {threshold:.2%}，"
+                f"桶={remaining} 模型={model_remaining}），已从候选剔除"
             )
 
     return summary
@@ -97,6 +103,37 @@ async def exhausted_emails() -> Set[str]:
         for email, state in _state.items()
         if state.get("exhausted") and now - state.get("checked_at", 0.0) <= stale_after
     }
+
+
+# ==================== 每模型额度（fetchAvailableModels.quotaInfo） ====================
+# email -> {model_id: {"remainingFraction": float, "resetTime": str}}。
+# 数据来源与 retrieveUserQuotaSummary 的配额桶相互独立：桶是"账号×窗口"粒度，
+# 模型额度是"账号×模型"粒度（实抓 163547/0004 每模型自带 quotaInfo）。
+# 学习时机：fetch_credential_models（email 传入时）顺带解析，零额外请求。
+_model_quota_state: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+
+def set_model_quota(email: str, mapping: Dict[str, Dict[str, Any]]) -> None:
+    """登记一个凭证的每模型额度快照（fetch_credential_models 调用）。"""
+    if not email or not isinstance(mapping, dict):
+        return
+    if mapping:
+        _model_quota_state[email] = mapping
+    else:
+        _model_quota_state.pop(email, None)
+
+
+def _model_min_remaining(email: str) -> Optional[float]:
+    """该凭证所有模型 quotaInfo 里最小的 remainingFraction；无数据返回 None。"""
+    mapping = _model_quota_state.get(email)
+    if not mapping:
+        return None
+    values = [
+        entry["remainingFraction"]
+        for entry in mapping.values()
+        if isinstance(entry, dict) and isinstance(entry.get("remainingFraction"), (int, float))
+    ]
+    return min(values) if values else None
 
 
 async def quota_budget_loop() -> None:
@@ -136,4 +173,5 @@ def reset_state() -> None:
     """清空进程内状态（测试用）。"""
     global _task
     _state.clear()
+    _model_quota_state.clear()
     _task = None

@@ -44,6 +44,7 @@ from src.model_enum import (
     merge_model_params,
     parse_model_enums,
     parse_model_params,
+    parse_model_quota,
     resolve_model_enum,
 )
 from src.models import Model, model_to_dict
@@ -890,18 +891,25 @@ def _remember_signatures_from_line(line: str, trajectory_id: str) -> None:
 async def _stream_with_credential_slot(
     credential_key: str, **kwargs: Any
 ) -> AsyncGenerator[Any, None]:
-    """在"按凭证并发名额"内桥接 stream_post_async。
+    """在"按凭证并发名额 + 按凭证串行回合"内桥接 stream_post_async。
 
-    名额从流开始持有到流结束（含客户端提前断开），确保同一凭证的在途流数量
-    受控；异常或提前关闭都会在 finally 中归还。
+    - 并发名额从流开始持有到流结束（含客户端提前断开），确保同一凭证的在途
+      流数量受控；异常或提前关闭都会在 finally 中归还。
+    - 串行回合按凭证取用（§10.16 增强三）：真实客户端的串行语义是每个客户端
+      实例内串行；此前中间件全局回合锁会让一个账号的慢请求阻塞所有账号。
+      释放顺序与中间件约定一致：先并发名额、再回合锁（下个排队请求醒来时
+      并发已腾出）。
     """
     key = credential_key or "default"
     await credential_limiter.acquire(key)
+    turn_held = await request_pacer.acquire_turn_for(key)
     try:
         async for chunk in stream_post_async(**kwargs):
             yield chunk
     finally:
         credential_limiter.release(key)
+        if turn_held:
+            request_pacer.release_turn_for(key)
 
 
 def _fidelity_response(exc: FidelityError) -> Response:
@@ -1614,6 +1622,8 @@ async def non_stream_request(
         try:
             _cred_key = current_file or "default"
             await credential_limiter.acquire(_cred_key)
+            # 按凭证串行回合（§10.16 增强三，与流式路径同一语义）
+            _turn_held = await request_pacer.acquire_turn_for(_cred_key)
             try:
                 response = await post_async(
                     url=target_url,
@@ -1623,6 +1633,8 @@ async def non_stream_request(
                 )
             finally:
                 credential_limiter.release(_cred_key)
+                if _turn_held:
+                    request_pacer.release_turn_for(_cred_key)
 
             status_code = response.status_code
 
@@ -1853,6 +1865,7 @@ def _extract_model_ids_from_raw(data: Dict[str, Any]) -> List[str]:
 async def fetch_credential_models(
     access_token: str,
     proxy: Optional[str] = None,
+    email: Optional[str] = None,
 ) -> Optional[List[str]]:
     """
     获取单个凭证支持的模型 ID 列表（经过白名单过滤并补全衍生模型）。
@@ -1860,6 +1873,8 @@ async def fetch_credential_models(
     Args:
         access_token: 凭证访问令牌
         proxy: 该账号的独立出口代理（None = 沿用全局 PROXY 配置）
+        email: 传入凭证邮箱时，顺带解析响应里的每模型 quotaInfo 登记到
+            quota_budget（零额外请求，§10.16）
 
     Returns:
         成功返回 List[str]，请求失败返回 None
@@ -1879,9 +1894,14 @@ async def fetch_credential_models(
         if response.status_code == 200:
             data = response.json()
             # 顺带学习 model → MODEL_PLACEHOLDER 枚举映射（labels.model_enum 用）
-            # 与模型参数元数据（maxOutputTokens 等上限校验用）
+            # 与模型参数元数据（maxOutputTokens/thinkingLevel/disabled 等）
             merge_model_enums(parse_model_enums(data))
             merge_model_params(parse_model_params(data))
+            if email:
+                # 循环依赖，延迟导入
+                from src.quota_budget import set_model_quota
+
+                set_model_quota(email, parse_model_quota(data))
             return _extract_model_ids_from_raw(data)
         log.warning(
             f"[ANTIGRAVITY] fetch_credential_models failed ({response.status_code}): "
@@ -1922,12 +1942,74 @@ async def refresh_credential_models(
         return None
 
     models = await fetch_credential_models(
-        access_token, proxy=credential_data.get("proxy") or None
+        access_token,
+        proxy=credential_data.get("proxy") or None,
+        email=email,
     )
     if models is not None:
         await update_credential_state(email, {"supported_models": models})
         log.info(f"[ANTIGRAVITY] 已更新凭证 {email} 支持的模型列表 ({len(models)} 个)")
     return models
+
+
+async def fetch_upstream_token_count(
+    gemini_request: Dict[str, Any],
+    model_name: str = "",
+) -> Optional[int]:
+    """
+    真实上游 token 计数（``/v1internal:countTokens``，§10.16 增强 1）。
+
+    请求体按 proto schema（prediction_service.proto）还原：
+    ``{"request": {"contents": [...], "systemInstruction": {...}, "tools": [...]}}``
+    （master.CountTokensRequest 的对应字段），响应 ``{"totalTokens": int}``。
+    与 generateContent 同一 Go 转发器出站、同一 header 家族；读取型预检端点，
+    不消耗模型额度（P0 冒烟时复核）。
+
+    Returns:
+        成功返回 token 数；凭证不可用或上游失败返回 None（调用方决定降级策略）
+    """
+    request_part: Dict[str, Any] = {}
+    for key in ("contents", "systemInstruction", "tools"):
+        value = gemini_request.get(key)
+        if value:
+            request_part[key] = value
+    if not request_part.get("contents"):
+        return None
+
+    cred_result = await get_valid_credential(model_name=model_name or None)
+    if not cred_result:
+        log.warning("[ANTIGRAVITY COUNT] 无可用凭证，无法进行真实 token 计数")
+        return None
+    email, credential_data = cred_result
+    access_token = credential_data.get("access_token") or credential_data.get("token")
+    if not access_token:
+        return None
+
+    headers = build_antigravity_headers(access_token, model_name="agent")
+    try:
+        response = await post_async(
+            url=f"{await get_antigravity_api_url()}/v1internal:countTokens",
+            json={"request": request_part},
+            headers=headers,
+            timeout=30.0,
+            proxy=credential_data.get("proxy") or None,
+        )
+        if response.status_code != 200:
+            log.warning(
+                f"[ANTIGRAVITY COUNT] countTokens 失败 ({response.status_code}): "
+                f"{response.text[:200]}"
+            )
+            return None
+        data = response.json()
+        total = data.get("totalTokens")
+        if isinstance(total, bool) or not isinstance(total, int):
+            log.warning(f"[ANTIGRAVITY COUNT] countTokens 响应缺少 totalTokens: {str(data)[:200]}")
+            return None
+        log.debug(f"[ANTIGRAVITY COUNT] {model_name or 'auto'} → {total} tokens (cred={email})")
+        return total
+    except Exception as e:  # noqa: BLE001 - 计数失败不致命，由调用方降级
+        log.warning(f"[ANTIGRAVITY COUNT] countTokens exception: {e}")
+        return None
 
 
 async def _handle_model_not_found_for_credential(email: str, model_name: str) -> None:
