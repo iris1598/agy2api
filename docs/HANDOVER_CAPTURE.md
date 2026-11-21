@@ -31,8 +31,14 @@
 3. **并行工具调用布局**:一轮 N 个调用 = 单 model content N 个 fc part +
    单 model content N 个 fr part;fc/fr/text 是相邻独立 content。
    `openai2gemini` 的合并已改为只合并相邻 user 轮。
-4. **子代理 11 键形态本会话未触发**(parent_cascade_id/subagent_type 无新
-   证据;fidelity_schema 中的 11 键 orders 来自更早会话,来源待查)。
+4. **子代理 11 键形态:关闭为"不适用"**(owner 2026-11-21 拍板)。实抓证实
+   子代理没有独立端点(163547 全部 57 条请求同打 streamGenerateContent),
+   11 键只是客户端在自有子代理轨迹上多带 parent_cascade_id/subagent_type
+   两个元数据键。反代路径无"这是子代理"的信号字段,无从标注;真实用户
+   不开子代理时同样只发 9/10 键,"全顶层 cascade"是合法客户端画像,不模拟。
+   键序已存档于 fidelity_schema(11 键 orders),值来源不再追查。残留极小
+   不一致:caller 刻意透传 invoke_subagent 工具调用而代理不声明子代理轨迹
+   ——常规接入不出现,接受。
 5. agent_monitoring / checkpoint 请求为空 labels + uuid 尾 requestId;
    代理不主动发这两类,无需实现。
 

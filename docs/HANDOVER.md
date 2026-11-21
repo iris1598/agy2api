@@ -460,10 +460,15 @@ nonebot 项目，57 条 streamGenerateContent + 全量响应落盘），并明�
    Go≡Python 十键环。**pytest 225 passed**（+5）；`sniff_cli verify --envelope --json`
    全绿（labels_orders 已含十键形态）。
 
-5. **本轮覆盖缺口**（如实记录）：163547 **未出现子代理请求**（11 键
-   parent_cascade_id/subagent_type 形态本会话未触发，fidelity_schema 中的 11 键
-   orders 来自更早会话，来源待查）；agent_monitoring/checkpoint 请求为空 labels +
-   uuid 尾 requestId（代理不主动发这两类，无需实现）。
+5. **子代理 11 键形态关闭为"不适用"**（owner 2026-11-21 拍板）：实抓证实子代理
+   没有独立端点（163547 全部 57 条请求同打 streamGenerateContent），11 键只是
+   客户端在自有子代理轨迹上多带 parent_cascade_id/subagent_type 两个元数据键。
+   反代路径无"这是子代理"的信号字段，无从标注；真实用户不开子代理时同样只发
+   9/10 键，"全顶层 cascade"是合法客户端画像。键序已存档于 fidelity_schema
+   （11 键 orders），值来源不再追查。残留极小不一致：caller 刻意透传
+   invoke_subagent 工具调用而代理不声明子代理轨迹——常规接入不出现，接受。
+   agent_monitoring/checkpoint 请求为空 labels + uuid 尾 requestId（代理不主动发
+   这两类，无需实现）。
 
 6. **新发现的既有差距（未修，后续候选）**：真实客户端 systemInstruction 会随功能
    激活演化（0013 的 `<terminal_sandbox>` 段 ↔ 0080 的 `<artifacts>` 段）——代理
