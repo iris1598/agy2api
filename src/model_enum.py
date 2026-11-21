@@ -56,8 +56,25 @@ MODEL_ENUM_MAP: Dict[str, str] = {
 # 排除 fetchAvailableModels 里同级的 MODEL_PROVIDER_* 字段。
 _MODEL_ENUM_RE = re.compile(r"\bMODEL_(?!PROVIDER_)[A-Z][A-Z0-9_]*\b")
 
+# 实抓确认的模型参数（2026-11-21）：gemini-2.5-flash 的 metadata
+# maxOutputTokens=65535；gemini-4-hydrogen 主力档（low/medium/high/xhigh）
+# 的 agent 请求 maxOutputTokens=262144。仅收录有实抓证据的条目，
+# 没有证据的模型不参与上限校验（保持透传）。
+MODEL_PARAMS: Dict[str, Dict[str, Any]] = {
+    "gemini-2.5-flash": {"maxOutputTokens": 65535},
+    "gemini-4-hydrogen-low": {"maxOutputTokens": 262144},
+    "gemini-4-hydrogen-medium": {"maxOutputTokens": 262144},
+    "gemini-4-hydrogen-high": {"maxOutputTokens": 262144},
+    "gemini-4-hydrogen-xhigh": {"maxOutputTokens": 262144},
+}
+
+# fetchAvailableModels 响应里关注的参数键；缺失的键不记录。
+_PARAM_KEYS = ("maxOutputTokens", "supportsThinking", "minThinkingBudget")
+
 # 进程内学习到的映射（fetchAvailableModels 探测时刷新，覆盖内置表）
 _LEARNED_ENUM_MAP: Dict[str, str] = {}
+# 进程内学习到的模型参数（按模型整体合并，覆盖内置表）
+_LEARNED_PARAMS: Dict[str, Dict[str, Any]] = {}
 
 
 def _find_enum(node: Any, depth: int = 0) -> str:
@@ -121,9 +138,80 @@ def merge_model_enums(mapping: Optional[Dict[str, str]]) -> None:
     _LEARNED_ENUM_MAP.update(mapping)
 
 
+def _find_value(node: Any, key: str, depth: int = 0) -> Any:
+    """在任意嵌套结构里找指定键的值（响应形状未固化，宽松遍历）。"""
+    if depth > 6:
+        return None
+    if isinstance(node, dict):
+        if key in node:
+            return node[key]
+        for value in node.values():
+            found = _find_value(value, key, depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_value(value, key, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def parse_model_params(data: Any) -> Dict[str, Dict[str, Any]]:
+    """从 ``fetchAvailableModels`` 响应中提取 ``model_id -> 参数元数据``。
+
+    目前关注 maxOutputTokens / supportsThinking / minThinkingBudget；
+    只记录响应里真实出现过的键。
+    """
+    if not isinstance(data, dict):
+        return {}
+    models = data.get("models")
+    items: list = []
+    if isinstance(models, dict):
+        items = list(models.items())
+    elif isinstance(models, list):
+        for entry in models:
+            if not isinstance(entry, dict):
+                continue
+            model_id = entry.get("id") or entry.get("modelId") or entry.get("name") or ""
+            items.append((str(model_id), entry))
+
+    params: Dict[str, Dict[str, Any]] = {}
+    for model_id, info in items:
+        if not model_id or not isinstance(info, dict):
+            continue
+        found: Dict[str, Any] = {}
+        for key in _PARAM_KEYS:
+            value = _find_value(info, key)
+            if value is not None:
+                found[key] = value
+        if found:
+            params[str(model_id)] = found
+    return params
+
+
+def merge_model_params(mapping: Optional[Dict[str, Dict[str, Any]]]) -> None:
+    """合并学习到的模型参数到进程内缓存（按键覆盖，不整体替换）。"""
+    if not mapping:
+        return
+    for model, info in mapping.items():
+        _LEARNED_PARAMS.setdefault(model, {}).update(info)
+
+
+def get_model_param(model: str, key: str) -> Any:
+    """查询模型参数（如 maxOutputTokens）；无实抓/学习值返回 None。"""
+    if not model:
+        return None
+    learned = _LEARNED_PARAMS.get(model)
+    if learned and key in learned:
+        return learned[key]
+    return MODEL_PARAMS.get(model, {}).get(key)
+
+
 def clear_learned_enums() -> None:
     """清空进程内缓存（测试用）。"""
     _LEARNED_ENUM_MAP.clear()
+    _LEARNED_PARAMS.clear()
 
 
 def has_model_enum(model: str) -> bool:

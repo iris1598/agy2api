@@ -4,6 +4,7 @@ import asyncio
 import os
 import sys
 import time
+from types import SimpleNamespace
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -45,6 +46,48 @@ class TestModelEnumMap:
         assert parse_model_enums(data) == {
             "gemini-2.5-flash": "MODEL_GOOGLE_GEMINI_2_5_FLASH"
         }
+
+
+class TestModelParams:
+    """模型参数表（maxOutputTokens 等）与 fetchAvailableModels 学习模式。"""
+
+    def setup_method(self):
+        from src.model_enum import clear_learned_enums
+
+        clear_learned_enums()
+
+    def teardown_method(self):
+        from src.model_enum import clear_learned_enums
+
+        clear_learned_enums()
+
+    def test_builtin_params_seeded_from_capture(self):
+        from src.model_enum import get_model_param
+
+        assert get_model_param("gemini-2.5-flash", "maxOutputTokens") == 65535
+        assert get_model_param("gemini-4-hydrogen-medium", "maxOutputTokens") == 262144
+        # 无实抓证据的模型不参与上限校验
+        assert get_model_param("gemini-2.5-pro", "maxOutputTokens") is None
+        assert get_model_param("", "maxOutputTokens") is None
+
+    def test_parse_model_params_flat_and_nested(self):
+        from src.model_enum import parse_model_params
+
+        data = {
+            "models": {
+                "gemini-3-flash": {"maxOutputTokens": 32768},
+                "gemini-3-pro": {"metadata": {"supportsThinking": True}},
+            }
+        }
+        params = parse_model_params(data)
+        assert params["gemini-3-flash"] == {"maxOutputTokens": 32768}
+        assert params["gemini-3-pro"] == {"supportsThinking": True}
+
+    def test_learn_params_override_builtin(self):
+        from src.model_enum import get_model_param, merge_model_params, parse_model_params
+
+        merge_model_params(parse_model_params({"models": {"gemini-2.5-flash": {"maxOutputTokens": 40960}}}))
+        assert get_model_param("gemini-2.5-flash", "maxOutputTokens") == 40960
 
 
 class TestFidelityError:
@@ -99,6 +142,70 @@ class TestValidateClientRequest:
         validate_client_request(request, KNOWN_MODEL)
         assert request["generationConfig"] is not original
         assert original == {"thinkingConfig": {"thinkingLevel": "MEDIUM"}}
+
+    def test_minimal_suffix_injects_minimal(self):
+        from src.model_enum import merge_model_enums
+
+        # 表内暂无 -minimal 后缀模型，用学习表临时注册（真实枚举值以抓包为准）
+        merge_model_enums({"gemini-x-minimal": "MODEL_PLACEHOLDER_M000"})
+        request = {"contents": []}
+        validate_client_request(request, "gemini-x-minimal")
+        thinking = request["generationConfig"]["thinkingConfig"]
+        assert thinking["thinkingLevel"] == "MINIMAL"
+        assert thinking["includeThoughts"] is True
+
+
+class TestMaxOutputTokensValidation:
+    """严格模式 maxOutputTokens 上限校验（只拦有实抓证据的超限显式值）。"""
+
+    def test_explicit_over_limit_rejected(self):
+        request = {"contents": [], "generationConfig": {"maxOutputTokens": 999999}}
+        with pytest.raises(FidelityError) as exc_info:
+            validate_client_request(request, KNOWN_MODEL)
+        assert exc_info.value.reason == "generation_config_mismatch"
+
+    def test_at_limit_accepted(self):
+        request = {"contents": [], "generationConfig": {"maxOutputTokens": 262144}}
+        validate_client_request(request, KNOWN_MODEL)
+
+    def test_proxy_default_values_exempt(self):
+        # 65536/64000 是转换器官方标配默认值（含客户端未指定时被替换的情形）
+        for value in (65536, 64000):
+            request = {"contents": [], "generationConfig": {"maxOutputTokens": value}}
+            validate_client_request(request, KNOWN_MODEL)
+
+    def test_model_without_evidence_passes_through(self):
+        request = {"contents": [], "generationConfig": {"maxOutputTokens": 10 ** 9}}
+        validate_client_request(request, "gemini-2.5-pro")
+
+
+class TestNonStrictClamp:
+    """非严格模式下转换器对超限显式值做钳制；严格模式保留原值交给 fidelity 拒绝。"""
+
+    async def _normalize(self, monkeypatch, strict: bool) -> dict:
+        from src.converter import antigravity_fix
+        from src.model_enum import clear_learned_enums
+
+        async def _flag():
+            return strict
+
+        monkeypatch.setattr(antigravity_fix, "get_strict_fidelity_enabled", _flag)
+        clear_learned_enums()
+        profile = SimpleNamespace(family="gemini")
+        generation_config = {"maxOutputTokens": 999999}
+        result = await antigravity_fix._normalize_generation_config(
+            {}, generation_config, profile, "gemini-2.5-flash"
+        )
+        clear_learned_enums()
+        return result
+
+    async def test_clamps_over_limit_when_not_strict(self, monkeypatch):
+        result = await self._normalize(monkeypatch, strict=False)
+        assert result["maxOutputTokens"] == 65535
+
+    async def test_keeps_value_when_strict(self, monkeypatch):
+        result = await self._normalize(monkeypatch, strict=True)
+        assert result["maxOutputTokens"] == 999999
 
 
 class TestThoughtSignatureCache:

@@ -6,7 +6,7 @@
 
 from typing import Any, Dict, Optional
 
-from src.model_enum import has_model_enum
+from src.model_enum import get_model_param, has_model_enum
 
 # reason → HTTP 状态码
 _STATUS_BY_REASON = {
@@ -55,9 +55,17 @@ class FidelityError(Exception):
         }
 
 
+# antigravity_fix 的官方标配 maxOutputTokens 默认值（客户端未指定或指定 64k 档
+# 时统一替换）。这是代理自身注入的标准值而非客户端意图，不参与上限拒绝；
+# 否则实抓 metadata 上限 65535（如 gemini-2.5-flash）会误杀默认请求。
+_PROXY_DEFAULT_MAX_OUTPUT = (65536, 64000)
+
+
 def _thinking_level_from_model(model: str) -> str:
     lowered = (model or "").lower()
-    for suffix in ("low", "medium", "high"):
+    # MINIMAL 见于 2.34.0 实抓（agent_monitoring 形态，gemini-3.5-flash-lite）；
+    # xhigh 后缀暂无 agent 信封实抓证据，不参与校验（待抓包补证）。
+    for suffix in ("low", "medium", "high", "minimal"):
         if lowered.endswith("-" + suffix):
             return suffix.upper()
     return ""
@@ -99,6 +107,22 @@ def _validate_generation_config(request: Dict[str, Any], model: str) -> None:
         thinking["thinkingLevel"] = wanted
         thinking.setdefault("includeThoughts", True)
         config["thinkingConfig"] = thinking
+
+    # maxOutputTokens 上限只校验有实抓证据的模型；代理默认值豁免（见常量注释），
+    # 客户端显式超限值直接拒绝（宁可报错，不静默降级）。
+    limit = get_model_param(model, "maxOutputTokens")
+    value = config.get("maxOutputTokens")
+    if (
+        limit is not None
+        and value not in _PROXY_DEFAULT_MAX_OUTPUT
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > limit
+    ):
+        raise FidelityError(
+            "generation_config_mismatch",
+            f"模型 {model} 的 maxOutputTokens 实抓上限为 {limit}，客户端给出 {value}",
+        )
     request["generationConfig"] = config
 
 

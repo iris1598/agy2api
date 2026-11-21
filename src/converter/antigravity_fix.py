@@ -24,6 +24,7 @@ from config import (
     rewrite_model_name,
 )
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
+from src.model_enum import get_model_param
 
 # ==================== 常量配置 ====================
 
@@ -951,7 +952,7 @@ def _enforce_uppercase_schema_types(schema: Any) -> None:
             _enforce_uppercase_schema_types(item)
 
 
-def _normalize_generation_config(
+async def _normalize_generation_config(
     result: Dict[str, Any],
     generation_config: Dict[str, Any],
     profile: "ModelProfile",
@@ -1011,6 +1012,22 @@ def _normalize_generation_config(
     default_max_output = CLAUDE_MAX_OUTPUT_TOKENS if is_claude_model else GEMINI_MAX_OUTPUT_TOKENS
     if generation_config.get("maxOutputTokens") in (None, 65536, 64000):
         generation_config["maxOutputTokens"] = default_max_output
+    elif not await get_strict_fidelity_enabled():
+        # 非严格模式：客户端显式值超过实抓上限时钳制；严格模式不做静默降级，
+        # 交给 fidelity.validate_client_request 报 generation_config_mismatch。
+        limit = get_model_param(upstream, "maxOutputTokens")
+        value = generation_config.get("maxOutputTokens")
+        if (
+            limit is not None
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > limit
+        ):
+            print(
+                f"[ANTIGRAVITY] maxOutputTokens {value} 超过 {upstream} 实抓上限 {limit}，钳制为 {limit}",
+                flush=True,
+            )
+            generation_config["maxOutputTokens"] = limit
 
     # generationConfig 内部键序: candidateCount -> maxOutputTokens -> thinkingConfig -> temperature -> topP -> topK -> 其余
     ordered_keys = [
@@ -1130,7 +1147,7 @@ async def normalize_antigravity_request(
     result.pop("system_instruction", None)
 
     # ========== 5. thinkingConfig / generationConfig 归一 ==========
-    generation_config = _normalize_generation_config(result, generation_config, profile, upstream)
+    generation_config = await _normalize_generation_config(result, generation_config, profile, upstream)
 
     # ========== 公共处理 ==========
     result.pop("thinkingConfig", None)

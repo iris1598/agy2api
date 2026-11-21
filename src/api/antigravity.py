@@ -37,7 +37,13 @@ from src.request_pacer import request_pacer
 from src import thought_signature_cache
 from src.credential_limiter import credential_limiter
 from src.fidelity import FidelityError, validate_client_request
-from src.model_enum import merge_model_enums, parse_model_enums, resolve_model_enum
+from src.model_enum import (
+    merge_model_enums,
+    merge_model_params,
+    parse_model_enums,
+    parse_model_params,
+    resolve_model_enum,
+)
 from src.models import Model, model_to_dict
 from src.storage.database import get_database
 from src.utils import ANTIGRAVITY_USER_AGENT
@@ -1438,7 +1444,9 @@ async def fetch_credential_models(
         if response.status_code == 200:
             data = response.json()
             # 顺带学习 model → MODEL_PLACEHOLDER 枚举映射（labels.model_enum 用）
+            # 与模型参数元数据（maxOutputTokens 等上限校验用）
             merge_model_enums(parse_model_enums(data))
+            merge_model_params(parse_model_params(data))
             return _extract_model_ids_from_raw(data)
         log.warning(
             f"[ANTIGRAVITY] fetch_credential_models failed ({response.status_code}): "
