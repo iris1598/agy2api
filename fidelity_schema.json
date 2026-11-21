@@ -1,0 +1,311 @@
+{
+  "version": 1,
+  "generated_at": "2026-11-21T03:52:00+00:00",
+  "endpoints": {
+    "loadCodeAssist": {
+      "methods": [
+        "POST"
+      ],
+      "header_order": [
+        "Host",
+        "User-Agent",
+        "Content-Length",
+        "Authorization",
+        "Content-Type",
+        "Accept-Encoding"
+      ],
+      "framing": [
+        "content-length"
+      ],
+      "envelope_keys": [
+        "metadata"
+      ],
+      "inner_keys": [],
+      "request_types": [],
+      "labels_keys": [],
+      "inner_orders": [],
+      "labels_orders": [],
+      "user_agent_field": [],
+      "contents_count": []
+    },
+    "listExperiments": {
+      "methods": [
+        "POST"
+      ],
+      "header_order": [
+        "Host",
+        "User-Agent",
+        "Content-Length",
+        "Authorization",
+        "Content-Type",
+        "Accept-Encoding"
+      ],
+      "framing": [
+        "content-length"
+      ],
+      "envelope_keys": [
+        "project",
+        "metadata"
+      ],
+      "inner_keys": [],
+      "request_types": [],
+      "labels_keys": [],
+      "inner_orders": [],
+      "labels_orders": [],
+      "user_agent_field": [],
+      "contents_count": []
+    },
+    "fetchUserInfo": {
+      "methods": [
+        "POST"
+      ],
+      "header_order": [
+        "Host",
+        "User-Agent",
+        "Content-Length",
+        "Authorization",
+        "Content-Type",
+        "Accept-Encoding"
+      ],
+      "framing": [
+        "content-length"
+      ],
+      "envelope_keys": [
+        "project"
+      ],
+      "inner_keys": [],
+      "request_types": [],
+      "labels_keys": [],
+      "inner_orders": [],
+      "labels_orders": [],
+      "user_agent_field": [],
+      "contents_count": []
+    },
+    "fetchAvailableModels": {
+      "methods": [
+        "POST"
+      ],
+      "header_order": [
+        "Host",
+        "User-Agent",
+        "Content-Length",
+        "Authorization",
+        "Content-Type",
+        "Accept-Encoding"
+      ],
+      "framing": [
+        "content-length"
+      ],
+      "envelope_keys": [
+        "project"
+      ],
+      "inner_keys": [],
+      "request_types": [],
+      "labels_keys": [],
+      "inner_orders": [],
+      "labels_orders": [],
+      "user_agent_field": [],
+      "contents_count": []
+    },
+    "cascadeNuxes": {
+      "methods": [
+        "GET"
+      ],
+      "header_order": [
+        "Host",
+        "User-Agent",
+        "Authorization",
+        "Accept-Encoding"
+      ],
+      "framing": [
+        "none"
+      ],
+      "envelope_keys": [],
+      "inner_keys": [],
+      "request_types": [],
+      "labels_keys": [],
+      "inner_orders": [],
+      "labels_orders": [],
+      "user_agent_field": [],
+      "contents_count": []
+    },
+    "writeTrajectoryAcls": {
+      "methods": [
+        "POST"
+      ],
+      "header_order": [
+        "Host",
+        "User-Agent",
+        "Content-Length",
+        "Authorization",
+        "Content-Type",
+        "Accept-Encoding"
+      ],
+      "framing": [
+        "content-length"
+      ],
+      "envelope_keys": [
+        "trajectoryId"
+      ],
+      "inner_keys": [],
+      "request_types": [],
+      "labels_keys": [],
+      "inner_orders": [],
+      "labels_orders": [],
+      "user_agent_field": [],
+      "contents_count": []
+    },
+    "streamGenerateContent": {
+      "methods": [
+        "POST"
+      ],
+      "header_order": [
+        "Host",
+        "User-Agent",
+        "Transfer-Encoding",
+        "Authorization",
+        "Content-Type",
+        "Accept-Encoding"
+      ],
+      "framing": [
+        "chunked"
+      ],
+      "envelope_keys": [
+        "project",
+        "requestId",
+        "request",
+        "model",
+        "userAgent",
+        "requestType"
+      ],
+      "inner_keys": [
+        "contents",
+        "systemInstruction",
+        "generationConfig",
+        "sessionId",
+        "tools",
+        "labels"
+      ],
+      "request_types": [
+        "checkpoint",
+        "agent",
+        "agent_monitoring"
+      ],
+      "labels_keys": [
+        "cascade_id",
+        "last_step_index",
+        "model_enum",
+        "request_id",
+        "root_cascade_id",
+        "trajectory_id",
+        "used_claude",
+        "used_claude_conservative",
+        "used_non_gemini_model",
+        "parent_cascade_id",
+        "subagent_type",
+        "last_execution_id"
+      ],
+      "inner_orders": [
+        [
+          "contents",
+          "systemInstruction",
+          "generationConfig",
+          "sessionId"
+        ],
+        [
+          "contents",
+          "systemInstruction",
+          "tools",
+          "labels",
+          "generationConfig",
+          "sessionId"
+        ]
+      ],
+      "labels_orders": [
+        [
+          "cascade_id",
+          "last_step_index",
+          "model_enum",
+          "request_id",
+          "root_cascade_id",
+          "trajectory_id",
+          "used_claude",
+          "used_claude_conservative",
+          "used_non_gemini_model"
+        ],
+        [
+          "cascade_id",
+          "last_step_index",
+          "model_enum",
+          "parent_cascade_id",
+          "request_id",
+          "root_cascade_id",
+          "subagent_type",
+          "trajectory_id",
+          "used_claude",
+          "used_claude_conservative",
+          "used_non_gemini_model"
+        ],
+        [
+          "cascade_id",
+          "last_execution_id",
+          "last_step_index",
+          "model_enum",
+          "request_id",
+          "root_cascade_id",
+          "trajectory_id",
+          "used_claude",
+          "used_claude_conservative",
+          "used_non_gemini_model"
+        ]
+      ],
+      "user_agent_field": [
+        "antigravity"
+      ],
+      "contents_count": [
+        1,
+        5
+      ]
+    }
+  },
+  "models": {
+    "gemini-3.5-flash-lite": {
+      "model_enum": "",
+      "generation_config": {
+        "thinkingConfig": {
+          "includeThoughts": true,
+          "thinkingLevel": "MINIMAL"
+        }
+      },
+      "request_types": [
+        "checkpoint",
+        "agent_monitoring"
+      ]
+    },
+    "gemini-4-hydrogen-medium": {
+      "model_enum": "MODEL_PLACEHOLDER_M526",
+      "generation_config": {
+        "maxOutputTokens": 262144,
+        "thinkingConfig": {
+          "includeThoughts": true,
+          "thinkingLevel": "MEDIUM"
+        }
+      },
+      "request_types": [
+        "agent"
+      ]
+    },
+    "gemini-4-hydrogen-sonar": {
+      "model_enum": "",
+      "generation_config": {
+        "thinkingConfig": {
+          "includeThoughts": true,
+          "thinkingLevel": "LOW"
+        }
+      },
+      "request_types": [
+        "agent_monitoring"
+      ]
+    }
+  }
+}

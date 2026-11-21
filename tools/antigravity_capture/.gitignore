@@ -1,0 +1,5 @@
+# 抓包结果包含提示词/PII，绝不提交
+captures/
+logs/
+__pycache__/
+*.pyc
