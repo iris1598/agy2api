@@ -143,16 +143,26 @@ class TestValidateClientRequest:
         assert request["generationConfig"] is not original
         assert original == {"thinkingConfig": {"thinkingLevel": "MEDIUM"}}
 
-    def test_minimal_suffix_injects_minimal(self):
+    def test_minimal_not_injected_for_unknown_suffix(self):
+        """MINIMAL 不属于用户可见模型档位（实抓中仅见于 agent_monitoring + flash-lite
+        内部模型，agent 聊天路径 0 条）；无档位后缀的模型不注入 thinkingConfig。"""
         from src.model_enum import merge_model_enums
 
-        # 表内暂无 -minimal 后缀模型，用学习表临时注册（真实枚举值以抓包为准）
-        merge_model_enums({"gemini-x-minimal": "MODEL_PLACEHOLDER_M000"})
+        merge_model_enums({"gemini-3.5-flash-lite": "MODEL_PLACEHOLDER_M198"})
         request = {"contents": []}
-        validate_client_request(request, "gemini-x-minimal")
-        thinking = request["generationConfig"]["thinkingConfig"]
-        assert thinking["thinkingLevel"] == "MINIMAL"
-        assert thinking["includeThoughts"] is True
+        validate_client_request(request, "gemini-3.5-flash-lite")
+        # 无档位后缀 → 整个 thinkingConfig 校验/注入跳过（不创建 generationConfig）
+        assert "generationConfig" not in request
+
+    def test_client_minimal_rejected_on_tiered_model(self):
+        """档位模型（-low/-medium/-high）上客户端给 MINIMAL 视为冲突，直接拒绝。"""
+        request = {
+            "contents": [],
+            "generationConfig": {"thinkingConfig": {"thinkingLevel": "MINIMAL"}},
+        }
+        with pytest.raises(FidelityError) as exc_info:
+            validate_client_request(request, KNOWN_MODEL)
+        assert exc_info.value.reason == "generation_config_mismatch"
 
 
 class TestMaxOutputTokensValidation:

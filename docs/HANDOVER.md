@@ -301,10 +301,16 @@ portable Go 1.27.4 编译的。临时目录不保证长期存在，接手者需�
 - `src/model_enum.py` 新增 `MODEL_PARAMS` 种子表（实抓证据：gemini-2.5-flash 65535、
   gemini-4-hydrogen 主力档 262144）+ `parse_model_params`/`merge_model_params`/`get_model_param`
   运行时学习（接入点 `fetch_credential_models`）。
-- `src/fidelity.py`：thinkingLevel 合法集合补 **MINIMAL**；新增 maxOutputTokens 严格校验
+- `src/fidelity.py`：新增 maxOutputTokens 严格校验
   （超实抓上限 → `generation_config_mismatch`；**代理默认值 65536/64000 豁免**——否则
-  gemini-2.5-flash 的实抓上限 65535 会误杀默认请求）。`xhigh` 后缀无 agent 信封实抓证据，
-  暂不参与校验（待抓包补证）。
+  gemini-2.5-flash 的实抓上限 65535 会误杀默认请求）。
+  **thinkingLevel 档位修正（owner 2026-11-21 指正）**：用户可见模型档位只有
+  low/medium/high（部分系列有 extra high），最低是 low，**没有 MINIMAL**。
+  曾按本文档 §4 P1 的说法补过 MINIMAL，核实后已回退：实抓中 MINIMAL 只出现在
+  agent_monitoring 辅助请求（gemini-3.5-flash-lite）与 fetchAvailableModels 的
+  flash-lite 元数据里，agent 聊天路径 0 条；本代理只发 agent 请求。
+  `xhigh` 后缀模型 owner 确认档位存在，但实抓未覆盖 xhigh 模型请求、档位字符串未证实，
+  按"无证据不注入"暂不参与校验（待抓包补证）。
 - `src/converter/antigravity_fix.py`：非严格模式对超限显式值钳制（严格模式交 fidelity 拒绝）。
   `_normalize_generation_config` 因此改为 async。
 
@@ -344,5 +350,6 @@ portable Go 1.27.4 编译的。临时目录不保证长期存在，接手者需�
 2. **CI 验证**：push 到 origin 后确认 fidelity.yml 三平台绿、release.yml 打 tag 发产物。
 3. **P3.1 信封构造下沉 Go**（本轮明确推迟）：Python 拼 `wrap_cli_request` → Go 只发送的现状保持。
 4. **P2.4 观察项**：串行模式回合锁仍是全局（中间件层拿不到凭证）。
-5. `xhigh` 后缀 thinkingLevel：待抓包补证后再决定是否纳入校验。
+5. `xhigh` 后缀 thinkingLevel：owner 确认 extra high 档位存在，但缺 xhigh 模型的 agent
+   请求实抓（上游报文档位字符串未证实）；抓到后按实抓字符串纳入档位校验。
 6. 版本号：`version.txt` 由 CI 自动 bump，无需手动改。

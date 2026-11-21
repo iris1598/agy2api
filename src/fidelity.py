@@ -63,9 +63,13 @@ _PROXY_DEFAULT_MAX_OUTPUT = (65536, 64000)
 
 def _thinking_level_from_model(model: str) -> str:
     lowered = (model or "").lower()
-    # MINIMAL 见于 2.34.0 实抓（agent_monitoring 形态，gemini-3.5-flash-lite）；
-    # xhigh 后缀暂无 agent 信封实抓证据，不参与校验（待抓包补证）。
-    for suffix in ("low", "medium", "high", "minimal"):
+    # 用户可见模型的档位集合是 low/medium/high（部分系列有 extra high，见 xhigh 后缀），
+    # 档位随模型变化（owner 2026-11-21 确认）。
+    # MINIMAL 不纳入：实抓中它只出现在 agent_monitoring 辅助请求 + flash-lite 内部模型上，
+    # agent 聊天路径 0 条；本代理只发 agent 请求，不应注入/接受 MINIMAL。
+    # xhigh 后缀模型暂不参与校验：owner 确认该档位存在，但实抓未覆盖 xhigh 模型请求，
+    # 上游报文里的真实档位字符串未证实——按"无证据不注入"原则等抓包补证。
+    for suffix in ("low", "medium", "high"):
         if lowered.endswith("-" + suffix):
             return suffix.upper()
     return ""
