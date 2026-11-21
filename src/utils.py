@@ -14,8 +14,8 @@ security = HTTPBearer()
 # 出站 User-Agent 对齐官方 Hub 签名（版本号与 CL 为 Google Piper 内部构建点，
 # 必须成对出现、全球正版客户端统一，切勿随机变动）：
 #   antigravity/hub/{OFFICIAL_HUB_VERSION} (aidev_client; os_type=windows; arch=amd64; cl={OFFICIAL_HUB_CL})
-OFFICIAL_HUB_VERSION = "2.28.0"
-OFFICIAL_HUB_CL = "1008300195"
+OFFICIAL_HUB_VERSION = "2.34.0"
+OFFICIAL_HUB_CL = "1026637980"
 _HUB_FINGERPRINT_OS = "windows"
 _HUB_FINGERPRINT_ARCH = "amd64"
 

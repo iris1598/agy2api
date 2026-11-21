@@ -10,6 +10,7 @@ Request Pacer - 单账号请求节流与随机抖动（防封禁）
 import asyncio
 import random
 import time
+from typing import Any, Dict
 
 from config import (
     get_request_throttle_enabled,
@@ -34,6 +35,8 @@ class RequestPacer:
         self._turn_lock = asyncio.Lock()
         self._refresh_interval = 5.0
         self._last_refresh = 0.0
+        # 按凭证维度的节流状态（key → {lock, last_sent}）
+        self._keyed: Dict[str, Dict[str, Any]] = {}
 
     async def refresh_config(self):
         """从配置系统读取最新配置（支持控制面板热更新）"""
@@ -86,6 +89,33 @@ class RequestPacer:
                 await asyncio.sleep(wait)
 
             self._last_sent = time.monotonic()
+
+    async def pace_for(self, key: str) -> None:
+        """按凭证维度的最小间隔 + 随机抖动。
+
+        与全局 ``pace()`` 的区别：多个账号之间不再互相拖慢，也不会因为别的账号
+        空闲而让某个账号产生突发。串行模式下由中间件的回合锁统一控制，这里跳过。
+        """
+        await self._maybe_refresh()
+
+        if not self._enabled or self._serial_mode:
+            return
+
+        state = self._keyed.setdefault(
+            key or "default", {"lock": asyncio.Lock(), "last_sent": None}
+        )
+        async with state["lock"]:
+            now = time.monotonic()
+            wait = 0.0
+            last_sent = state["last_sent"]
+            if last_sent is not None:
+                elapsed = now - last_sent
+                if elapsed < self._min_interval:
+                    wait = self._min_interval - elapsed
+            wait += random.uniform(0.0, self._jitter)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            state["last_sent"] = time.monotonic()
 
     async def acquire_turn(self) -> bool:
         """串行模式：请求开始前调用，等待上一个请求结束后再进入。

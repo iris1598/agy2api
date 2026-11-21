@@ -20,6 +20,7 @@ from config import (
     get_model_rewrite_filter,
     get_return_thoughts_to_frontend,
     get_sensitive_word_filter,
+    get_strict_fidelity_enabled,
     rewrite_model_name,
 )
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
@@ -1138,7 +1139,10 @@ async def normalize_antigravity_request(
     generation_config.pop("frequencyPenalty", None)
     generation_config.pop("stopSequences", None)
 
-    result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
+    # 实抓的真实客户端**不发送** safetySettings；严格模式下不再注入这个字段，
+    # 避免多出一个可识别的差异。非严格模式保留原有的风控缓解行为。
+    if not await get_strict_fidelity_enabled():
+        result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
 
     # 显式覆盖（result 与入参共享 generationConfig 引用，必须切断）
     result.pop("generationConfig", None)

@@ -18,9 +18,21 @@ import os
 import re
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.api.antigravity import wrap_cli_request  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _strict_off(monkeypatch):
+    """探活用例的模型未收录进枚举表，关闭严格模式（严格模式见 test_fidelity.py）。"""
+
+    async def _disabled():
+        return False
+
+    monkeypatch.setattr("src.api.antigravity.get_strict_fidelity_enabled", _disabled)
 
 PROBE_TEXT = "你好，请回复一个字。"
 TEST_MODEL = "gemini-2.5-flash-lite"
@@ -28,8 +40,11 @@ PROJECT_ID = "test-project"
 
 ENVELOPE_KEYS = {"project", "requestId", "request", "model", "userAgent", "requestType"}
 
-# requestId 五段式：agent/{conversationId}/{unixMs}/{trajectoryId}/{step}
-REQUEST_ID_RE = re.compile(r"^agent/[0-9a-f]{16}/\d{9,}/[0-9a-f]+/\d+$")
+# requestId 五段式：agent/{cascadeId}/{unixMs}/{trajectoryId}/{step}
+# 实测 cascadeId / trajectoryId 都是标准 UUID（与 labels 中对应字段同值）。
+REQUEST_ID_RE = re.compile(
+    r"^agent/[0-9a-f-]{36}/\d{9,}/[0-9a-f-]{36}/\d+$"
+)
 
 
 def _build() -> dict:
@@ -95,18 +110,21 @@ def test_request_id_five_segments() -> None:
     assert REQUEST_ID_RE.match(request_id), f"requestId 形态不符: {request_id}"
 
 
-def test_repeated_probe_not_identical() -> None:
-    """同一文本两次调用：unixMs / trajectoryId 必须不同（幂等隔离），
-    但 conversationId 段由 sessionId 派生，应保持一致。"""
-    first = _build()["requestId"]
-    second = _build()["requestId"]
+def test_repeated_probe_keeps_trajectory_and_bumps_request_seq() -> None:
+    """同一文本两次调用（对齐实抓语义）：
+    - cascadeId / trajectoryId 必须稳定（KV 缓存路由亲和）；
+    - labels.request_id 后缀逐请求自增（与 step 无关）。"""
+    first = _build()
+    second = _build()
 
-    assert first != second, "两次探活的 requestId 不应完全相同"
+    first_parts = first["requestId"].split("/")
+    second_parts = second["requestId"].split("/")
+    assert first_parts[1] == second_parts[1], "相同文本的 cascadeId 段应稳定"
+    assert first_parts[3] == second_parts[3], "相同会话的 trajectoryId 段应稳定"
 
-    first_parts = first.split("/")
-    second_parts = second.split("/")
-    assert first_parts[1] == second_parts[1], "相同文本的 conversationId 段应稳定"
-    assert first_parts[3] != second_parts[3], "trajectoryId 每请求应唯一"
+    first_seq = int(first["request"]["labels"]["request_id"].rsplit("-", 1)[1])
+    second_seq = int(second["request"]["labels"]["request_id"].rsplit("-", 1)[1])
+    assert second_seq == first_seq + 1, "labels.request_id 后缀应逐请求自增"
 
 
 def test_session_id_stable_for_same_text() -> None:

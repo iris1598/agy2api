@@ -6,11 +6,13 @@ Antigravity API Client - Handles communication with Google's Antigravity API
 import asyncio
 import hashlib
 import json
+import threading
 import time
 import traceback
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Callable, Set, Tuple
+from typing import Any, AsyncGenerator, Dict, List, NamedTuple, Optional, Callable, Set, Tuple
 
 from fastapi import Response
 from config import (
@@ -18,6 +20,7 @@ from config import (
     get_auto_ban_error_codes,
     get_request_log_enabled,
     get_request_log_error_codes,
+    get_strict_fidelity_enabled,
     get_usage_log_enabled,
 )
 from log import log
@@ -31,6 +34,10 @@ from src.credential_manager import (
 )
 from src.httpx_client import stream_post_async, post_async
 from src.request_pacer import request_pacer
+from src import thought_signature_cache
+from src.credential_limiter import credential_limiter
+from src.fidelity import FidelityError, validate_client_request
+from src.model_enum import merge_model_enums, parse_model_enums, resolve_model_enum
 from src.models import Model, model_to_dict
 from src.storage.database import get_database
 from src.utils import ANTIGRAVITY_USER_AGENT
@@ -54,76 +61,127 @@ from src.api.utils import (
 # ==================== 全局凭证管理器 ====================
 
 
+class UpstreamSessionIds(NamedTuple):
+    """同一会话确定性派生的三个上游标识。"""
+
+    session_id: str
+    trajectory_id: str
+    cascade_id: str
+
+
 def _derive_upstream_session_ids(
-    gemini_request: Dict[str, Any], model: str
-) -> Tuple[str, str]:
+    gemini_request: Dict[str, Any], model: str, account_salt: str = ""
+) -> UpstreamSessionIds:
     """
-    从联合锚点摘要确定性派生上游 (sessionId, trajectory_id)。
+    从联合锚点摘要确定性派生上游 (sessionId, trajectory_id, cascade_id)。
 
     联合锚点 = SHA256(model + systemInstruction 文本 + 前两条消息特征)，
     与 derive_session_key 同口径，保证:
-    - 同一会话跨轮次/跨请求 sessionId、trajectory_id 恒定（KV 缓存路由亲和）；
+    - 同一会话跨轮次/跨请求三者恒定（KV 缓存路由亲和）；
     - 共用相同 systemInstruction 的不同会话（多 Agent / 主子会话）不会撞车；
     - 摘要前 8 字节 → sessionId（沿用既有 -{int} 形态）；
-    - 摘要 8~24 字节 → 16 字节确定性 UUID 形态 trajectory_id。
+    - 摘要 8~24 字节 → 16 字节确定性 UUID 形态 trajectory_id；
+    - ``sha256("cascade:" + 摘要)[:16]`` → cascade_id（实测 cascade_id 与
+      root_cascade_id 同值，且等于 requestId 第 2 段；与 trajectory_id 不同源）。
 
-    无锚点（如空对话）时返回 ("", "")，由调用方兜底。
+    无锚点（如空对话）时返回全空，由调用方兜底。
     """
     digest = derive_conversation_anchor(model, gemini_request)
     if digest is None:
-        return "", ""
+        return UpstreamSessionIds("", "", "")
+    if account_salt:
+        # 账号盐：避免不同凭证对同一段内容派生出相同的 session/trajectory，
+        # 否则上游会看到"两个账号在跑同一条轨迹"这种强关联信号。
+        digest = hashlib.sha256(account_salt.encode("utf-8") + b"|" + digest).digest()
     session_int = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
     session_id = f"-{session_int}"
     trajectory_id = str(uuid.UUID(bytes=digest[8:24]))
-    return session_id, trajectory_id
+    cascade_id = str(uuid.UUID(bytes=hashlib.sha256(b"cascade:" + digest).digest()[:16]))
+    return UpstreamSessionIds(session_id, trajectory_id, cascade_id)
 
 
-def _generate_request_id(session_id: str, step: int, trajectory_id: str) -> str:
-    """构造官方形态的 requestId：`agent/{conversationId}/{unixMs}/{trajectoryId}/{step}`。
+def _generate_request_id(cascade_id: str, step: int, trajectory_id: str) -> str:
+    """构造官方形态的 requestId：`agent/{cascadeId}/{unixMs}/{trajectoryId}/{step}`。
 
-    官方样本（3 份报文逐字核对），例如：
-        agent/a89a2006-72b4-470d-8282-3f1e4c88dc29/1790410048596/d3a2e3d2-21f9-411b-967f-53811898c2cd/14
+    实抓样本（2 份报文交叉核对）：
+        agent/afb38f6a-74b6-459f-8edd-a75d8d00bc19/1795150502265/3ca3a2de-ad5c-4bbd-94f2-0a6cdca924c0/8
 
-    - conversationId 段使用 sessionId 的单向哈希派生而非原文，同一会话稳定；
+    - 第 2 段就是 labels.cascade_id / root_cascade_id 的原值（实测一致），
+      不是 sessionId 的哈希；
     - unixMs 段每次请求都不同 → 天然的幂等隔离，避免重试命中上一次的 429 / 旧缓存；
     - trajectoryId 段同一会话恒定（确定性派生自会话锚点），上游据此关联同一轨迹的
-      连续 step，保证隐式 KV 缓存的路由亲和；不同会话天然隔离。
+      连续 step，保证隐式 KV 缓存的路由亲和；不同会话天然隔离；
+    - 末段 step = last_step_index + 1（实测 7→8、9→10）。
     """
     ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    if session_id:
-        conversation = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
-    else:
-        conversation = str(uuid.uuid4())
+    conversation = cascade_id or str(uuid.uuid4())
     if not trajectory_id:
         trajectory_id = str(uuid.uuid4())
     return f"agent/{conversation}/{ts_ms}/{trajectory_id}/{step}"
 
 
-def _build_labels(model: str, trajectory_id: str, step: int) -> Dict[str, str]:
+# 轨迹请求计数（labels.request_id 后缀）：实测同一 trajectory 内逐请求自增，
+# 与 step 无关。进程内维护，重启归零可接受；LRU 限制避免长期运行时无限增长。
+_TRAJECTORY_REQUEST_SEQ: "OrderedDict[str, int]" = OrderedDict()
+_TRAJECTORY_REQUEST_SEQ_LOCK = threading.Lock()
+_MAX_TRACKED_TRAJECTORIES = 2048
+
+
+def _reset_trajectory_request_seq() -> None:
+    """清空轨迹请求计数（仅供测试）。"""
+    with _TRAJECTORY_REQUEST_SEQ_LOCK:
+        _TRAJECTORY_REQUEST_SEQ.clear()
+
+
+def _next_trajectory_request_seq(trajectory_id: str) -> int:
+    """同一 trajectory 的 labels.request_id 自增计数（实抓从 0 开始）。"""
+    with _TRAJECTORY_REQUEST_SEQ_LOCK:
+        seq = _TRAJECTORY_REQUEST_SEQ.get(trajectory_id, -1) + 1
+        _TRAJECTORY_REQUEST_SEQ[trajectory_id] = seq
+        _TRAJECTORY_REQUEST_SEQ.move_to_end(trajectory_id)
+        while len(_TRAJECTORY_REQUEST_SEQ) > _MAX_TRACKED_TRAJECTORIES:
+            _TRAJECTORY_REQUEST_SEQ.popitem(last=False)
+        return seq
+
+
+def _build_labels(
+    model: str,
+    trajectory_id: str,
+    step: int,
+    *,
+    cascade_id: str,
+    request_seq: int,
+) -> Dict[str, str]:
     """构建官方上下文标签元数据（键序按官方字母序排布）。
 
-    官方样本（HAR 抓包）：
+    实抓样本（2026-11-21，language_server 2.34.0，streamGenerateContent）：
     {
-      "last_step_index": "2",
-      "model_enum": "MODEL_PLACEHOLDER_M320",
-      "request_id": "0917011e-4959-4da9-8554-20499ed72869-2",
-      "trajectory_id": "0917011e-4959-4da9-8554-20499ed72869",
+      "cascade_id": "5c6b5422-381c-406b-ab6b-f22fad9f7bff",
+      "last_step_index": "8",
+      "model_enum": "MODEL_PLACEHOLDER_M526",
+      "request_id": "3ca3a2de-ad5c-4bbd-94f2-0a6cdca924c0-2",
+      "root_cascade_id": "afb38f6a-74b6-459f-8edd-a75d8d00bc19",
+      "trajectory_id": "3ca3a2de-ad5c-4bbd-94f2-0a6cdca924c0",
       "used_claude": "false",
       "used_claude_conservative": "false",
       "used_non_gemini_model": "false"
     }
 
-    step 传入「当前步索引」（模型轮数 + 1），与顶层 requestId 末段同步，
-    request_id 同步使用该值。
+    - ``last_step_index`` = 当前步索引 - 1（实测 requestId 末段 = 它 + 1）；
+    - ``model_enum`` 是内部枚举值而非模型名（见 src/model_enum.py）；
+    - ``request_id`` 后缀是 trajectory 内逐请求自增计数，不是 step。
     """
     model_lower = model.lower() if model else ""
     used_claude = "claude" in model_lower
     # used_non_gemini_model：Claude / gpt-oss 等非 Gemini 家族模型为 true
     used_non_gemini = used_claude or "gpt-oss" in model_lower or "grok" in model_lower
+    root_cascade_id = cascade_id
     return {
-        "last_step_index": str(step),
-        "model_enum": model,
-        "request_id": f"{trajectory_id}-{step}",
+        "cascade_id": cascade_id,
+        "last_step_index": str(max(step - 1, 0)),
+        "model_enum": resolve_model_enum(model),
+        "request_id": f"{trajectory_id}-{request_seq}",
+        "root_cascade_id": root_cascade_id,
         "trajectory_id": trajectory_id,
         "used_claude": str(used_claude).lower(),
         "used_claude_conservative": str(used_claude).lower(),
@@ -201,30 +259,42 @@ async def wrap_cli_request(
     gemini_request: Dict[str, Any],
     model: str,
     project_id: str,
+    account_salt: str = "",
 ) -> Tuple[Dict[str, Any], str]:
     """
     将 Gemini 格式请求包装成 Antigravity CLI 格式（对齐官方 v1internal 信封）。
     返回 (payload, request_id)。
 
     顶层信封严格遵循官方键序: project -> requestId -> request -> model -> userAgent -> requestType。
+
+    严格模式（默认开启）下，入站请求先经 src/fidelity.py 校验：字段白名单、
+    模型枚举存在性、thinkingConfig 与模型档位一致；不满足直接抛 FidelityError。
     """
     # 浅拷贝 + 只重建需要修改的层（toolConfig/functionCallingConfig），
     # 避免对大 payload（长对话历史）做整体 deepcopy 的热路径开销；
     # contents 等未修改字段与调用方共享引用（调用方随后不再修改）
     inner = dict(gemini_request)
 
+    if await get_strict_fidelity_enabled():
+        validate_client_request(inner, model)
+
     # 注入 sessionId（联合锚点 = model + systemInstruction + 前两条消息特征，
     # 与 derive_session_key 同口径）：同会话跨轮次恒定，共 system 的不同会话不撞车，
     # 上游据此做隐式 KV 缓存的路由亲和；客户端显式携带 sessionId 时原样透传
     session_id = str(inner.get("sessionId") or "").strip()
-    derived_session_id, derived_trajectory_id = _derive_upstream_session_ids(inner, model)
+    derived_ids = _derive_upstream_session_ids(inner, model, account_salt)
     if not session_id:
-        session_id = derived_session_id or f"-{uuid.uuid4().int % 9_000_000_000_000_000_000}"
+        session_id = (
+            derived_ids.session_id
+            or f"-{uuid.uuid4().int % 9_000_000_000_000_000_000}"
+        )
         inner["sessionId"] = session_id
 
-    # step：以 contents 中已完成的模型轮数为基准（当前步 = 模型轮数 + 1），
-    # 同步写入 requestId 末段与 labels（last_step_index / request_id 后缀），
-    # 保证轨迹元数据随对话轮次连续递增
+    # step：实抓规律为 step = 1 + 2 * (contents 中 model 消息数)。
+    # 依据 2.34.0 样本（20261121-112701 / 101904 全序列）：
+    #   model 消息 0 条 → step=1；1 条（含工具调用）→ step=3；2 条 → step=5；
+    #   101904 连续重试序列 193 条 contents / 192 条 model → step=385，完全吻合。
+    # labels.last_step_index = step - 1。
     model_turns = 0
     contents = inner.get("contents")
     if isinstance(contents, list):
@@ -233,16 +303,27 @@ async def wrap_cli_request(
             for content in contents
             if isinstance(content, dict) and content.get("role") == "model"
         )
-    step = model_turns + 1
+    step = 1 + 2 * model_turns
 
-    # requestId：官方 5 段形态 agent/{conversationId}/{unixMs}/{trajectoryId}/{step}
-    # trajectoryId 与 sessionId 同源确定性派生（无锚点时各自随机兜底），
-    # 与顶层 requestId 严格同步一致
-    trajectory_id = derived_trajectory_id or str(uuid.uuid4())
-    request_id = _generate_request_id(session_id, step, trajectory_id)
+    # requestId：官方 5 段形态 agent/{cascadeId}/{unixMs}/{trajectoryId}/{step}
+    # cascadeId / trajectoryId 与 sessionId 同源确定性派生（无锚点时各自随机兜底），
+    # 第 2 段与 labels.cascade_id 严格一致
+    trajectory_id = derived_ids.trajectory_id or str(uuid.uuid4())
+    cascade_id = derived_ids.cascade_id or str(uuid.uuid4())
+    request_id = _generate_request_id(cascade_id, step, trajectory_id)
 
-    # 注入 labels（step 即当前步索引，与 requestId 末段同步）
-    inner["labels"] = _build_labels(model, trajectory_id, step)
+    # thoughtSignature 回注：真实客户端会把上一轮签名带回；兼容客户端常丢弃。
+    # 只补回本轨迹确实见过的签名，不伪造。
+    thought_signature_cache.replay_into_contents(inner.get("contents"), trajectory_id)
+
+    # 注入 labels（键序/键集完全对齐实抓样本；last_step_index = step - 1）
+    inner["labels"] = _build_labels(
+        model,
+        trajectory_id,
+        step,
+        cascade_id=cascade_id,
+        request_seq=_next_trajectory_request_seq(trajectory_id),
+    )
 
     # requestType 与 toolConfig 对齐官方 agent 状态机：
     # - 常规智能体交互（有 tools 或含工具调用上下文）→ agent；
@@ -315,12 +396,15 @@ def build_antigravity_headers(
     extra_headers: Optional[Dict[str, str]] = None,
     model_name: str = "",
 ) -> Dict[str, str]:
-    """构建 Antigravity CLI API 请求头（对齐官方 Hub 出站指纹）。"""
+    """构建 Antigravity CLI API 请求头（对齐官方 Hub 出站指纹）。
+
+    实测真实 Hub 只发送 User-Agent / Authorization / Content-Type / Accept-Encoding，
+    **不发 Accept**——多一个头同样是可识别的差异，故这里不再注入。
+    """
     headers = {
         "User-Agent": ANTIGRAVITY_USER_AGENT,
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
-        "Accept": "*/*",
         "Accept-Encoding": "gzip",
     }
 
@@ -333,6 +417,70 @@ def build_antigravity_headers(
 def _is_retryable_status(status_code: int, disable_error_codes: List[int]) -> bool:
     """统一判断是否属于可重试状态码。"""
     return status_code in (429, 503) or status_code in disable_error_codes
+
+
+def _remember_signatures_from_data(data: Any, trajectory_id: str) -> None:
+    """从上游响应里提取 thoughtSignature 并按文本缓存（供后续轮次回注）。"""
+    if not trajectory_id or not isinstance(data, dict):
+        return
+    inner = data.get("response") if isinstance(data.get("response"), dict) else data
+    candidates = inner.get("candidates")
+    if not isinstance(candidates, list):
+        return
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            signature = part.get("thoughtSignature")
+            if isinstance(text, str) and text and isinstance(signature, str) and signature:
+                thought_signature_cache.remember(trajectory_id, text, signature)
+
+
+def _remember_signatures_from_line(line: str, trajectory_id: str) -> None:
+    """解析单条 SSE data 帧并缓存签名（仅在命中子串时调用）。"""
+    if not line.startswith("data:"):
+        return
+    try:
+        data = json.loads(line[len("data:"):].strip())
+    except (json.JSONDecodeError, ValueError):
+        return
+    _remember_signatures_from_data(data, trajectory_id)
+
+
+async def _stream_with_credential_slot(
+    credential_key: str, **kwargs: Any
+) -> AsyncGenerator[Any, None]:
+    """在"按凭证并发名额"内桥接 stream_post_async。
+
+    名额从流开始持有到流结束（含客户端提前断开），确保同一凭证的在途流数量
+    受控；异常或提前关闭都会在 finally 中归还。
+    """
+    key = credential_key or "default"
+    await credential_limiter.acquire(key)
+    try:
+        async for chunk in stream_post_async(**kwargs):
+            yield chunk
+    finally:
+        credential_limiter.release(key)
+
+
+def _fidelity_response(exc: FidelityError) -> Response:
+    """把保真度拒绝转成固定结构的错误响应（不重试、不计入上游调用）。"""
+    log.error(f"[FIDELITY] 拒绝请求: {exc.reason} - {exc.detail}")
+    return Response(
+        content=json.dumps(exc.to_payload(), ensure_ascii=False),
+        status_code=exc.status_code,
+        media_type="application/json",
+    )
 
 
 async def _switch_credential_for_retry(
@@ -510,9 +658,23 @@ async def stream_request(
 
     auth_headers = build_antigravity_headers(access_token, headers, model_name)
 
-    # 构建 CLI 格式请求体
+    # 构建 CLI 格式请求体（严格模式下可能直接拒绝）
     inner_request = body.get("request", body)
-    final_payload, _ = await wrap_cli_request(inner_request, model_name, project_id)
+    try:
+        final_payload, _ = await wrap_cli_request(
+            inner_request, model_name, project_id, account_salt=current_file
+        )
+    except FidelityError as exc:
+        log_entry.update({
+            "status_code": exc.status_code, "success": False,
+            "error_message": f"{exc.reason}: {exc.detail}",
+            "use_time": time.time() - log_start_time,
+        })
+        await record_usage_log(log_entry)
+        yield _fidelity_response(exc)
+        return
+
+    trajectory_id = final_payload["request"]["labels"]["trajectory_id"]
 
     # 3. 调用stream_post_async进行请求
     retry_config = await get_retry_config()
@@ -573,7 +735,7 @@ async def stream_request(
 
     for attempt in range(max_retries + 1):
         # 防封禁：请求节流 + 随机抖动（每次发送前调用）
-        await request_pacer.pace()
+        await request_pacer.pace_for(current_file or "default")
 
         success_recorded = False  # 标记是否已记录成功
         need_retry = False  # 标记是否需要重试
@@ -610,7 +772,8 @@ async def stream_request(
             })
 
         try:
-            async for chunk in stream_post_async(
+            async for chunk in _stream_with_credential_slot(
+                current_file,
                 url=target_url,
                 body=final_payload,
                 native=native,
@@ -720,6 +883,10 @@ async def stream_request(
                         if extracted:
                             usage_tokens = extracted
 
+                    # 缓存上游返回的 thoughtSignature，供后续轮次回注
+                    if native is False and "thoughtSignature" in chunk:
+                        _remember_signatures_from_line(chunk, trajectory_id)
+
                     yield chunk
 
             # 流式请求完成，检查结果
@@ -768,6 +935,12 @@ async def stream_request(
                     )
                     return
                 continue  # 重试
+
+        except FidelityError as exc:
+            # 保真度拒绝不重试：换凭证/换出口都不会让它变得"像"。
+            await _log_stream_result(exc.status_code, False, f"{exc.reason}: {exc.detail}")
+            yield _fidelity_response(exc)
+            return
 
         except GeneratorExit:
             # 下游提前关闭了本生成器（转换器断流、抗截断续传、客户端断开等）。
@@ -923,9 +1096,17 @@ async def non_stream_request(
 
     auth_headers = build_antigravity_headers(access_token, headers, model_name)
 
-    # 构建 CLI 格式请求体
+    # 构建 CLI 格式请求体（严格模式下可能直接拒绝）
     inner_request = body.get("request", body)
-    final_payload, _ = await wrap_cli_request(inner_request, model_name, project_id)
+    try:
+        final_payload, _ = await wrap_cli_request(
+            inner_request, model_name, project_id, account_salt=current_file
+        )
+    except FidelityError as exc:
+        await _log_result(exc.status_code, False, error_message=f"{exc.reason}: {exc.detail}")
+        return _fidelity_response(exc)
+
+    trajectory_id = final_payload["request"]["labels"]["trajectory_id"]
 
     # 3. 调用post_async进行请求
     retry_config = await get_retry_config()
@@ -984,18 +1165,23 @@ async def non_stream_request(
 
     for attempt in range(max_retries + 1):
         # 防封禁：请求节流 + 随机抖动（每次发送前调用）
-        await request_pacer.pace()
+        await request_pacer.pace_for(current_file or "default")
 
         need_retry = False  # 标记是否需要重试
         attempt_start_time = time.time()  # 本次上游调用开始时间
         
         try:
-            response = await post_async(
-                url=target_url,
-                json=final_payload,
-                headers=auth_headers,
-                proxy=cred_proxy,
-            )
+            _cred_key = current_file or "default"
+            await credential_limiter.acquire(_cred_key)
+            try:
+                response = await post_async(
+                    url=target_url,
+                    json=final_payload,
+                    headers=auth_headers,
+                    proxy=cred_proxy,
+                )
+            finally:
+                credential_limiter.release(_cred_key)
 
             status_code = response.status_code
 
@@ -1023,6 +1209,11 @@ async def non_stream_request(
                         )
                 else:
                     # 正常响应
+                    if b"thoughtSignature" in response.content:
+                        try:
+                            _remember_signatures_from_data(response.json(), trajectory_id)
+                        except Exception:  # noqa: BLE001 - 签名缓存失败不影响主流程
+                            pass
                     await record_api_call_success(current_file, model_name=model_name)
                     await _log_result(200, True, response_content=response.content)
                     return Response(
@@ -1139,6 +1330,11 @@ async def non_stream_request(
                     )
                 continue  # 重试
 
+        except FidelityError as exc:
+            # 保真度拒绝不重试
+            await _log_result(exc.status_code, False, error_message=f"{exc.reason}: {exc.detail}")
+            return _fidelity_response(exc)
+
         except Exception as e:
             log.error(f"[ANTIGRAVITY] 非流式请求异常: {e}, 凭证: {current_file}")
             if attempt < max_retries:
@@ -1241,6 +1437,8 @@ async def fetch_credential_models(
         )
         if response.status_code == 200:
             data = response.json()
+            # 顺带学习 model → MODEL_PLACEHOLDER 枚举映射（labels.model_enum 用）
+            merge_model_enums(parse_model_enums(data))
             return _extract_model_ids_from_raw(data)
         log.warning(
             f"[ANTIGRAVITY] fetch_credential_models failed ({response.status_code}): "
