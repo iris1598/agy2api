@@ -91,6 +91,16 @@ async def lifespan(app: FastAPI):
 
     # OAuth回调服务器将在需要时按需启动
 
+    # 出站 TLS 核心后台健康检查（本进程拉起的转发器退出后自动重启）
+    try:
+        from config import get_upstream_tls_impersonation_enabled
+        from src import upstream_proxy
+
+        if await get_upstream_tls_impersonation_enabled():
+            upstream_proxy.start_monitor()
+    except Exception as e:
+        log.warning(f"转发器健康检查启动失败（不影响请求）: {e}")
+
     # 每凭证额度预算后台刷新（防封：接近阈值提前剔除候选，不等 429）
     try:
         from config import get_quota_budget_enabled
@@ -136,9 +146,10 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.debug(f"关闭会话缓存时出错: {e}")
 
-    # 停止 Go 出站 TLS 转发器（若由本进程拉起）
+    # 停止 Go 出站 TLS 转发器（后台健康检查 + 本进程拉起的进程）
     try:
         from src import upstream_proxy
+        await upstream_proxy.stop_monitor()
         upstream_proxy.stop()
     except Exception as e:
         log.debug(f"关闭 Go 转发器时出错: {e}")

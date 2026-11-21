@@ -297,6 +297,103 @@ if [ ! -f "web.py" ]; then
     exit 1
 fi
 
+# ==================== Go 出站核心（严格模式必需） ====================
+REPO_SLUG="iris1598/agy2api"
+FORWARDER_BIN_DIR="tools/upstream_tls_proxy/bin"
+
+forwarder_hint() {
+    log_warn "严格模式（STRICT_FIDELITY 默认开启）要求 Go 出站核心，缺失时服务会拒绝启动。"
+    log_warn "解决方式任选其一:"
+    log_warn "  1) 手动下载 Release 产物放入 ${FORWARDER_BIN_DIR}/: https://github.com/${REPO_SLUG}/releases"
+    log_warn "  2) 安装 Go >= 1.26 后本地编译: bash tools/upstream_tls_proxy/build.sh"
+    log_warn "  3) 使用 Docker 部署（镜像已内置 Go 出站核心）"
+}
+
+detect_forwarder_asset() {
+    case "$(uname -s)" in
+        Linux)  local goos="linux" ;;
+        Darwin) local goos="darwin" ;;
+        *) echo ""; return ;;
+    esac
+    case "$(uname -m)" in
+        x86_64|amd64)   local arch="amd64" ;;
+        aarch64|arm64)  local arch="arm64" ;;
+        armv7*|armv6*)  local arch="arm" ;;
+        *) echo ""; return ;;
+    esac
+    echo "upstream-proxy-${goos}-${arch}"
+}
+
+download_forwarder() {
+    local asset="$1"
+    local url="https://github.com/${REPO_SLUG}/releases/latest/download/${asset}"
+    log_info "从 GitHub Release 下载 Go 出站核心: $asset ..."
+    mkdir -p "$FORWARDER_BIN_DIR"
+    if ! curl -fLsS "$url" -o "$FORWARDER_BIN_DIR/$asset"; then
+        log_warn "下载失败（可能尚无 Release 或网络不可达）"
+        rm -f "$FORWARDER_BIN_DIR/$asset"
+        return 1
+    fi
+    chmod +x "$FORWARDER_BIN_DIR/$asset"
+
+    # macOS: 清除可能的 quarantine 属性（浏览器代理下载场景）
+    if [ "$(uname -s)" = "Darwin" ] && command -v xattr &> /dev/null; then
+        xattr -d com.apple.quarantine "$FORWARDER_BIN_DIR/$asset" 2>/dev/null || true
+    fi
+
+    # SHA256 校验（Release 附带 SHA256SUMS.txt；不匹配视为致命）
+    if curl -fLsS "https://github.com/${REPO_SLUG}/releases/latest/download/SHA256SUMS.txt" \
+        -o /tmp/agy2api-SHA256SUMS.txt 2>/dev/null; then
+        local expected actual
+        expected=$(awk -v a="$asset" '$2==a {print $1}' /tmp/agy2api-SHA256SUMS.txt)
+        if command -v sha256sum &> /dev/null; then
+            actual=$(sha256sum "$FORWARDER_BIN_DIR/$asset" | awk '{print $1}')
+        else
+            actual=$(shasum -a 256 "$FORWARDER_BIN_DIR/$asset" | awk '{print $1}')
+        fi
+        rm -f /tmp/agy2api-SHA256SUMS.txt
+        if [ -z "$expected" ]; then
+            log_warn "SHA256SUMS.txt 中没有 $asset 的记录，跳过校验"
+        elif [ "$expected" != "$actual" ]; then
+            log_error "SHA256 校验失败（期望 $expected，实际 $actual）"
+            rm -f "$FORWARDER_BIN_DIR/$asset"
+            exit 1
+        else
+            log_info "SHA256 校验通过"
+        fi
+    else
+        log_warn "无法下载 SHA256SUMS.txt，跳过校验"
+    fi
+    log_info "Go 出站核心就绪: $FORWARDER_BIN_DIR/$asset"
+    return 0
+}
+
+ensure_forwarder_binary() {
+    local plain="$FORWARDER_BIN_DIR/upstream-proxy"
+    if [ -f "$plain" ]; then
+        log_info "Go 出站核心已存在: $plain"
+        return 0
+    fi
+    local asset
+    asset=$(detect_forwarder_asset)
+    if [ -n "$asset" ] && download_forwarder "$asset"; then
+        return 0
+    fi
+    # 下载失败时尝试本地编译（有 Go 环境就顺手补上）
+    if command -v go &> /dev/null || [ -x /usr/local/go/bin/go ]; then
+        log_info "尝试本地编译 Go 出站核心..."
+        if bash tools/upstream_tls_proxy/build.sh; then
+            return 0
+        fi
+        log_warn "本地编译失败"
+    fi
+    forwarder_hint
+    log_error "未获得 Go 出站核心，退出安装。"
+    exit 1
+}
+
+ensure_forwarder_binary
+
 # Start the application
 log_info "Starting application..."
 python3 web.py

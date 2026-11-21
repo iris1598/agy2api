@@ -208,20 +208,25 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 - `PATH_PREFIX`: 反代保留路径前缀（如 `/AGY2API`）时配置，由后端在路由匹配前剥掉该前缀；默认：空（不剥离）
 
 **出站 TLS 指纹（Go 转发器）**
-- `UPSTREAM_TLS_IMPERSONATION`: 启用 Go 出站 TLS 转发器（默认：true）。开启后发往 Antigravity API 的请求经本机 Go 转发器出站，ClientHello（JA3/密码套件/扩展/PQ 曲线组/ALPN）与真实客户端逐段一致；二进制缺失或启动失败时自动回退 httpx。
+- `UPSTREAM_TLS_IMPERSONATION`: 启用 Go 出站 TLS 转发器（默认：true）。开启后发往 Antigravity API 的请求经本机 Go 转发器出站，ClientHello（JA3/密码套件/扩展/PQ 曲线组/ALPN）与真实客户端逐段一致；转发器不可用时**直接报错不回退**（见严格模式）。服务运行期间有后台健康检查，本进程拉起的转发器意外退出会自动重启。
 - `UPSTREAM_TLS_PROXY_URL`: 转发器监听地址（默认：`http://127.0.0.1:17890`）
-- `UPSTREAM_TLS_PROXY_BIN`: 手动指定转发器二进制路径（默认自动查找 `tools/upstream_tls_proxy/bin/`）
+- `UPSTREAM_TLS_PROXY_BIN`: 手动指定转发器二进制路径（默认自动查找 `tools/upstream_tls_proxy/bin/`，同时支持本机构建的无后缀名与 release 的 `upstream-proxy-<goos>-<goarch>` 平台后缀名）
 
-> 源码运行需自行编译一次转发器（需要 Go ≥ 1.26）：`powershell -ExecutionPolicy Bypass -File .\tools\upstream_tls_proxy\build.ps1`（Linux/macOS 用 `bash tools/upstream_tls_proxy/build.sh`）。Docker 镜像已内置编译阶段。
+> 获取转发器二进制（任选其一）：① 运行安装脚本（install.ps1 / install.sh / termux-install.sh），会自动从 GitHub Release 下载对应平台产物并校验 SHA256；② 源码编译（需要 Go ≥ 1.26）：`powershell -ExecutionPolicy Bypass -File .\tools\upstream_tls_proxy\build.ps1`（Linux/macOS 用 `bash tools/upstream_tls_proxy/build.sh`）；③ Docker 镜像已内置编译阶段。发布产物由 CI 在 push `v*` 标签时自动构建并上传 Release。
 
 **保真度与防封**
-- `STRICT_FIDELITY`: 严格模式（默认：true）。模型枚举缺失、客户端携带真实客户端不会发的字段、参数与模型档位冲突、Go 出站核心不可用等情况**直接返回错误**，不发上游请求、不静默降级；启动时也会自检，不可用则拒绝启动。
+- `STRICT_FIDELITY`: 严格模式（默认：true）。模型枚举缺失、客户端携带真实客户端不会发的字段、thinkingLevel 与模型档位冲突、maxOutputTokens 超过实抓上限、Go 出站核心不可用等情况**直接返回错误**，不发上游请求、不静默降级；启动时也会自检，不可用则拒绝启动。
 - `CREDENTIAL_MAX_CONCURRENT`: 单凭证在途请求上限（默认：2，0 表示不限），超出在本地排队而不是换号。
+- `QUOTA_BUDGET_ENABLED`: 每凭证额度预算（默认：true）。后台定期调用 `retrieveUserQuotaSummary` 刷新各账号剩余额度，任一配额桶低于 `QUOTA_BUDGET_THRESHOLD`（默认：0.1，即 10%）就提前把该账号从凭证选取中剔除，不等 429；刷新失败或数据过期按未耗尽处理（不影响可用性）。
+- `QUOTA_BUDGET_REFRESH_MINUTES`: 额度刷新间隔，分钟（默认：30）。
+- `MODEL_MIX_ENABLED`: 模型分布约束（默认：false）。开启后按账号统计每日高价模型（Claude / Gemini 高档位）请求数，达到 `MODEL_MIX_DAILY_LIMIT`（默认：50，0 表示不限）当天不再承接高价模型请求；同时检测"恒定速率"自动化模式并输出告警日志（只告警不自动停用）。
 
 **性能和稳定性配置**
 - `RETRY_429_ENABLED`: 启用错误自动重试（默认：true）
 - `RETRY_429_MAX_RETRIES`: 最大重试次数（默认：5）
-- `RETRY_429_INTERVAL`: 重试间隔，秒（默认：1）
+- `RETRY_429_INTERVAL`: 基础重试间隔，秒（默认：1）
+- `BACKOFF_ENABLED`: 重试指数退避（默认：true）。开启后按账号连续失败次数做 2^n 指数退避 + 随机抖动（成功即复位）；上游返回明确冷却时间时仍以冷却逻辑优先。关闭则退回固定 `RETRY_429_INTERVAL` 等待
+- `BACKOFF_MAX_DELAY`: 单次退避等待上限，秒（默认：60）
 - `ANTI_TRUNCATION_MAX_ATTEMPTS`: 抗截断最大重试次数（默认：3）
 
 **并发与速率控制配置（可在控制面板"配置管理"中设置并热更新）**

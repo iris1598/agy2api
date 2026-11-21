@@ -1,0 +1,50 @@
+name: release
+
+# push v* 标签时交叉编译全部平台产物并发布 GitHub Release。
+# 安装脚本(install.ps1 / install.sh / termux-install.sh)优先从这里
+# 下载对应平台二进制并校验 SHA256SUMS.txt。
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+
+      - name: Cross-compile all targets
+        run: bash tools/upstream_tls_proxy/build-all.sh
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd tools/upstream_tls_proxy/bin
+          sha256sum upstream-proxy-* > SHA256SUMS.txt
+
+      - name: Show artifacts
+        run: ls -lh tools/upstream_tls_proxy/bin/
+
+      - name: Create GitHub Release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" tools/upstream_tls_proxy/bin/upstream-proxy-* \
+              tools/upstream_tls_proxy/bin/SHA256SUMS.txt --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" \
+              tools/upstream_tls_proxy/bin/upstream-proxy-* \
+              tools/upstream_tls_proxy/bin/SHA256SUMS.txt \
+              --repo "$REPO" --title "$TAG" --generate-notes
+          fi

@@ -51,5 +51,54 @@ else
     exit 1
 fi
 
+# ==================== Go 出站核心（严格模式必需） ====================
+REPO_SLUG="iris1598/agy2api"
+FORWARDER_BIN_DIR="tools/upstream_tls_proxy/bin"
+case "$(uname -m)" in
+    x86_64|amd64)  FORWARDER_ASSET="upstream-proxy-darwin-amd64" ;;
+    aarch64|arm64) FORWARDER_ASSET="upstream-proxy-darwin-arm64" ;;
+    *)             FORWARDER_ASSET="" ;;
+esac
+
+if [ -f "$FORWARDER_BIN_DIR/upstream-proxy" ]; then
+    echo "✅ Go 出站核心已存在: $FORWARDER_BIN_DIR/upstream-proxy"
+elif [ -n "$FORWARDER_ASSET" ]; then
+    echo "正在从 GitHub Release 下载 Go 出站核心: $FORWARDER_ASSET ..."
+    mkdir -p "$FORWARDER_BIN_DIR"
+    if curl -fLsS "https://github.com/${REPO_SLUG}/releases/latest/download/${FORWARDER_ASSET}" \
+        -o "$FORWARDER_BIN_DIR/$FORWARDER_ASSET"; then
+        chmod +x "$FORWARDER_BIN_DIR/$FORWARDER_ASSET"
+        # 清除可能的 quarantine 属性（浏览器代理下载场景）
+        xattr -d com.apple.quarantine "$FORWARDER_BIN_DIR/$FORWARDER_ASSET" 2>/dev/null || true
+        if curl -fLsS "https://github.com/${REPO_SLUG}/releases/latest/download/SHA256SUMS.txt" \
+            -o /tmp/agy2api-SHA256SUMS.txt 2>/dev/null; then
+            expected=$(awk -v a="$FORWARDER_ASSET" '$2==a {print $1}' /tmp/agy2api-SHA256SUMS.txt)
+            actual=$(shasum -a 256 "$FORWARDER_BIN_DIR/$FORWARDER_ASSET" | awk '{print $1}')
+            rm -f /tmp/agy2api-SHA256SUMS.txt
+            if [ -n "$expected" ] && [ "$expected" != "$actual" ]; then
+                echo "❌ SHA256 校验失败（期望 $expected，实际 $actual）"
+                rm -f "$FORWARDER_BIN_DIR/$FORWARDER_ASSET"
+                exit 1
+            fi
+            [ -n "$expected" ] && echo "✅ SHA256 校验通过"
+        else
+            echo "⚠️ 无法下载 SHA256SUMS.txt，跳过校验"
+        fi
+        echo "✅ Go 出站核心就绪: $FORWARDER_BIN_DIR/$FORWARDER_ASSET"
+    else
+        rm -f "$FORWARDER_BIN_DIR/$FORWARDER_ASSET"
+        echo "❌ 下载失败（可能尚无 Release 或网络不可达），退出安装。"
+        echo "   严格模式下 Go 出站核心缺失会导致服务拒绝启动。解决方式："
+        echo "   1) 手动下载: https://github.com/${REPO_SLUG}/releases → 放入 ${FORWARDER_BIN_DIR}/"
+        echo "   2) 本地编译（brew install go）: bash tools/upstream_tls_proxy/build.sh"
+        echo "   3) 关闭严格模式（不推荐）: STRICT_FIDELITY=false"
+        exit 1
+    fi
+else
+    echo "❌ 无法识别架构（uname -m = $(uname -m)），请手动下载产物放入 ${FORWARDER_BIN_DIR}/"
+    echo "   https://github.com/${REPO_SLUG}/releases"
+    exit 1
+fi
+
 # 启动项目
 python3 web.py

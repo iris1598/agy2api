@@ -163,6 +163,53 @@ fi
 echo "安装 Python 依赖..."
 uv add -r requirements.txt
 
+# ==================== Go 出站核心（严格模式必需） ====================
+REPO_SLUG="iris1598/agy2api"
+FORWARDER_BIN_DIR="tools/upstream_tls_proxy/bin"
+case "$(uname -m)" in
+    aarch64|arm64) FORWARDER_ASSET="upstream-proxy-linux-arm64" ;;
+    armv7*|armv6*) FORWARDER_ASSET="upstream-proxy-linux-arm" ;;
+    *)             FORWARDER_ASSET="" ;;
+esac
+
+if [ -f "$FORWARDER_BIN_DIR/upstream-proxy" ]; then
+    echo "✅ Go 出站核心已存在: $FORWARDER_BIN_DIR/upstream-proxy"
+elif [ -n "$FORWARDER_ASSET" ]; then
+    echo "正在从 GitHub Release 下载 Go 出站核心: $FORWARDER_ASSET ..."
+    mkdir -p "$FORWARDER_BIN_DIR"
+    if curl -fLsS "https://github.com/${REPO_SLUG}/releases/latest/download/${FORWARDER_ASSET}" \
+        -o "$FORWARDER_BIN_DIR/$FORWARDER_ASSET"; then
+        chmod +x "$FORWARDER_BIN_DIR/$FORWARDER_ASSET"
+        if curl -fLsS "https://github.com/${REPO_SLUG}/releases/latest/download/SHA256SUMS.txt" \
+            -o "$TMPDIR/agy2api-SHA256SUMS.txt" 2>/dev/null; then
+            expected=$(awk -v a="$FORWARDER_ASSET" '$2==a {print $1}' "$TMPDIR/agy2api-SHA256SUMS.txt")
+            actual=$(sha256sum "$FORWARDER_BIN_DIR/$FORWARDER_ASSET" | awk '{print $1}')
+            rm -f "$TMPDIR/agy2api-SHA256SUMS.txt"
+            if [ -n "$expected" ] && [ "$expected" != "$actual" ]; then
+                echo "❌ SHA256 校验失败（期望 $expected，实际 $actual）"
+                rm -f "$FORWARDER_BIN_DIR/$FORWARDER_ASSET"
+                exit 1
+            fi
+            [ -n "$expected" ] && echo "✅ SHA256 校验通过"
+        else
+            echo "⚠️ 无法下载 SHA256SUMS.txt，跳过校验"
+        fi
+        echo "✅ Go 出站核心就绪: $FORWARDER_BIN_DIR/$FORWARDER_ASSET"
+    else
+        rm -f "$FORWARDER_BIN_DIR/$FORWARDER_ASSET"
+        echo "❌ 下载失败（可能尚无 Release 或网络不可达），退出安装。"
+        echo "   严格模式下 Go 出站核心缺失会导致服务拒绝启动。解决方式："
+        echo "   1) 手动下载: https://github.com/${REPO_SLUG}/releases → 放入 ${FORWARDER_BIN_DIR}/"
+        echo "   2) Termux 装 Go 后本地编译: pkg install golang && bash tools/upstream_tls_proxy/build.sh"
+        echo "   3) 关闭严格模式（不推荐）: STRICT_FIDELITY=false"
+        exit 1
+    fi
+else
+    echo "❌ 无法识别架构（uname -m = $(uname -m)），请手动下载产物放入 ${FORWARDER_BIN_DIR}/"
+    echo "   https://github.com/${REPO_SLUG}/releases"
+    exit 1
+fi
+
 echo "激活虚拟环境并启动服务..."
 source .venv/bin/activate
 pm2 start .venv/bin/python --name web -- web.py

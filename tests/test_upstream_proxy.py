@@ -125,6 +125,7 @@ class TestBinaryDiscovery:
     def test_missing_returns_none(self, monkeypatch, tmp_path):
         monkeypatch.setenv("UPSTREAM_TLS_PROXY_BIN", str(tmp_path / "nope"))
         monkeypatch.setattr(upstream_proxy, "_BINARY_CANDIDATES", ())
+        monkeypatch.setattr(upstream_proxy, "_BIN_DIR", tmp_path)
         assert upstream_proxy.find_binary() is None
 
     def test_ensure_running_reuses_existing_listener(self):
@@ -140,9 +141,62 @@ class TestBinaryDiscovery:
     def test_ensure_running_without_binary_fails(self, monkeypatch):
         monkeypatch.setenv("UPSTREAM_TLS_PROXY_BIN", "")
         monkeypatch.setattr(upstream_proxy, "_BINARY_CANDIDATES", ())
+        monkeypatch.setattr(upstream_proxy, "_BIN_DIR", __import__("pathlib").Path("/nonexistent-agy2api-bin"))
         # 用一个必然空闲的端口，避免命中外层监听
         probe = socket.socket()
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
         probe.close()
         assert upstream_proxy.ensure_running(f"http://127.0.0.1:{port}") is False
+
+
+class TestPlatformAsset:
+    """平台后缀产物名与 build-all.sh 产物命名对齐（release 下载路径）。"""
+
+    def test_windows_amd64(self, monkeypatch):
+        monkeypatch.setattr(upstream_proxy.sys, "platform", "win32")
+        monkeypatch.setattr(upstream_proxy.platform, "machine", lambda: "AMD64")
+        assert upstream_proxy._platform_asset_name() == "upstream-proxy-windows-amd64.exe"
+
+    def test_linux_arm64(self, monkeypatch):
+        monkeypatch.setattr(upstream_proxy.sys, "platform", "linux")
+        monkeypatch.setattr(upstream_proxy.platform, "machine", lambda: "aarch64")
+        assert upstream_proxy._platform_asset_name() == "upstream-proxy-linux-arm64"
+
+    def test_linux_armv7(self, monkeypatch):
+        monkeypatch.setattr(upstream_proxy.sys, "platform", "linux")
+        monkeypatch.setattr(upstream_proxy.platform, "machine", lambda: "armv7l")
+        assert upstream_proxy._platform_asset_name() == "upstream-proxy-linux-arm"
+
+    def test_darwin_arm64(self, monkeypatch):
+        monkeypatch.setattr(upstream_proxy.sys, "platform", "darwin")
+        monkeypatch.setattr(upstream_proxy.platform, "machine", lambda: "arm64")
+        assert upstream_proxy._platform_asset_name() == "upstream-proxy-darwin-arm64"
+
+    def test_unknown_arch_returns_none(self, monkeypatch):
+        monkeypatch.setattr(upstream_proxy.sys, "platform", "linux")
+        monkeypatch.setattr(upstream_proxy.platform, "machine", lambda: "sparc")
+        assert upstream_proxy._platform_asset_name() is None
+
+    def test_find_binary_platform_suffix(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("UPSTREAM_TLS_PROXY_BIN", str(tmp_path / "nope"))
+        monkeypatch.setattr(upstream_proxy, "_BINARY_CANDIDATES", ())
+        monkeypatch.setattr(upstream_proxy, "_BIN_DIR", tmp_path)
+        monkeypatch.setattr(upstream_proxy.sys, "platform", "win32")
+        monkeypatch.setattr(upstream_proxy.platform, "machine", lambda: "AMD64")
+        binary = tmp_path / "upstream-proxy-windows-amd64.exe"
+        binary.write_bytes(b"stub")
+        assert upstream_proxy.find_binary() == binary
+
+
+class TestHealthMonitor:
+    async def test_status_shape(self):
+        state = upstream_proxy.status()
+        assert set(state) == {"listen", "binary", "managed_process", "pid", "monitor_running"}
+
+    async def test_start_stop_monitor(self):
+        upstream_proxy.start_monitor()
+        task = upstream_proxy._monitor_task
+        assert task is not None and not task.done()
+        await upstream_proxy.stop_monitor()
+        assert upstream_proxy._monitor_task is None or upstream_proxy._monitor_task.done()
