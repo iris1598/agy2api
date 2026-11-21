@@ -25,8 +25,11 @@ build() {
   local goos=$1 goarch=$2 suffix=$3 extra=${4:-}
   local out="bin/upstream-proxy-${goos}-${goarch}${suffix}"
   echo "building ${out}"
+  # extra 必须经 env 传递：$extra 展开出的 "GOARM=7" 不经 env 时会被 bash
+  # 当成命令名（解析期只认字面 NAME=value 词为赋值前缀），CI 实测报
+  # "GOARM=7: command not found"。
   # shellcheck disable=SC2086
-  CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" $extra \
+  env CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" $extra \
     "$GO_EXE" build -trimpath -ldflags "-s -w" -o "$out" .
 }
 
