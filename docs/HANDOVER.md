@@ -419,3 +419,57 @@ step 规律（`step = 1 + 2×(contents 中 role=="model" 的消息数)`，"192 �
 > **下一窗口任务**（owner 用 Antigravity 做真实开发项目并抓全过程）：
 > 见 `docs/HANDOVER_CAPTURE.md`——含抓取操作、last_execution_id 闭环预案、
 > 分析步骤与已踩坑清单。
+
+### 10.9 第四轮：真实转发会话闭环（HANDOVER_CAPTURE.md 任务的完成）
+
+owner 用转发模式完成一次真实开发会话（**20261121-163547**，Antigravity 真实开发
+nonebot 项目，57 条 streamGenerateContent + 全量响应落盘），并明确指正：**该会话是
+唯一实抓基准，此前所有离线模拟会话（114847 等）不再作为地面真值**。据此完成闭环：
+
+1. **step 公式二次修正（推翻 §10.8 的 `1+2×model 轮`）**。33 条 agent 请求全序列
+   拟合（轨迹 d5cdfe46）：
+   `step = user 轮数 + 非(纯 functionResponse)的 model 轮数 + functionCall part 数`，
+   fr 不计轮；**并行调用按 part 数计**（0020 的 [user, model(fc×2), model(fr×2)] →
+   自然步号 4）。旧公式与它在"每轮恰好 1 次调用"时巧合相等（离线样本全部落在
+   该巧合区），163547 的并行调用/重发暴露了差异。
+   **step 不是纯 contents 函数**：0013 请求 502 失败后客户端原样重发（0014），
+   step 1→2，此后该轨迹 31 条请求全部带这个 +1 偏移。实现：`_natural_step` +
+   `_resolve_trajectory_step`（轨迹级重发偏移，LRU 进程内态，随
+   `_reset_trajectory_request_seq` 一并重置；空 contents 兜底取下限 1）。
+
+2. **last_execution_id 闭环（§10.8 第 3 点的待证项）**：该值由**客户端本地生成**
+   （uuid4），不出现在任何上游响应或其它端点中；出现规律 = 存在位于"最后一个
+   user 轮"之前的 fr 轮，且**同一工具轮在同一 user 周期内保持同值，新 user 轮开启
+   后更替**（0074-0078 同值 X，0080-0085 同值 Z，X≠Z；0020-0067 工具续跑期不携带）。
+   代理无法复现本地随机值，以确定性派生替代：sha256(trajectory_id | 最后一个
+   user 轮之前的最后一个 fr 轮内容规范 JSON) → uuid v4 形态——历史中同一 fr 轮
+   逐字节相同 → 值稳定，与实抓稳定性模式逐请求一致（不伪造：值本身是客户端本地
+   状态，上游从不回显校验）。实现 `_resolve_last_execution_id`；`_build_labels`
+   十键（键序 cascade_id 之后）；Go 侧 `last_execution_id,omitempty` +
+   **协议版本 2→3**（v2 二进制会静默丢键，握手拒绝，需重编译）。
+
+3. **converter 布局对齐实抓**：`openai2gemini` 末尾的相邻同角色合并改为**只合并
+   相邻 user 轮**（历史兼容 user-role fr 的 0-token 空回场景）。实抓证明真实客户端
+   的 model(fc)/model(fr)/model(text) 是相邻独立 content（并行调用=单 content N
+   part），旧合并把它们压成单 content，破坏布局与 step 口径。
+
+4. **黄金样本换 163547/0080**（十键+多周期历史）；实抓环用
+   `_seed_trajectory_step_state(bumps=1)` 复放重发偏移，requestId 末段 77 逐字节
+   对照；`last_execution_id` 加入归一化集（值是客户端本地随机量，键存在性/键序由
+   断言守住）。新增测试：并行调用计数、重发 +1、lei 出现/周期内稳定/更替、
+   Go≡Python 十键环。**pytest 225 passed**（+5）；`sniff_cli verify --envelope --json`
+   全绿（labels_orders 已含十键形态）。
+
+5. **本轮覆盖缺口**（如实记录）：163547 **未出现子代理请求**（11 键
+   parent_cascade_id/subagent_type 形态本会话未触发，fidelity_schema 中的 11 键
+   orders 来自更早会话，来源待查）；agent_monitoring/checkpoint 请求为空 labels +
+   uuid 尾 requestId（代理不主动发这两类，无需实现）。
+
+6. **新发现的既有差距（未修，后续候选）**：真实客户端 systemInstruction 会随功能
+   激活演化（0013 的 `<terminal_sandbox>` 段 ↔ 0080 的 `<artifacts>` 段）——代理
+   按 model+sys+前两条消息派生 trajectory_id，sys 演化会导致同一会话派生出不同
+   trajectory（上游缓存亲和断裂）。若要修，方向是锚点只用首条消息+sys 稳定部分，
+   或客户端显式 sessionId 透传优先。
+
+> **遗留操作**：captures/20261121-163547 含提示词，处理完删除（gitignore，
+> 勿提交）；两个抓包遗留转发器进程已清理，Go 二进制已重建为协议 3。

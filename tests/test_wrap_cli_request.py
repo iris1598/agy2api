@@ -108,27 +108,30 @@ async def test_step_increments_with_model_turns():
 
     p3, rid3 = await wrap_cli_request(_session_a_turn3(), MODEL, "proj")
 
-    # turn1: 0 条 model 消息 → step = 1 + 2*0 = 1；last_step_index = 0
+    # turn1: [user] → 自然步号 1；last_step_index = 0
     assert rid1.split("/")[4] == "1"
     assert p1["request"]["labels"]["last_step_index"] == "0"
     # 实抓 labels.request_id 后缀从 0 开始
     assert p1["request"]["labels"]["request_id"] == f"{p1['request']['labels']['trajectory_id']}-0"
 
-    # turn3: 2 条 model 消息 → step = 1 + 2*2 = 5；同一 trajectory 内后缀自增
+    # turn3: [user×3, model×2(文本)] → 自然步号 = 3 user + 2 model 轮 = 5
     traj = p2["request"]["labels"]["trajectory_id"]
     assert rid2.split("/")[4] == "5"
-    assert rid3.split("/")[4] == "5"
     assert p2["request"]["labels"]["last_step_index"] == "4"
     assert p2["request"]["labels"]["request_id"] == f"{traj}-0"
     assert p3["request"]["labels"]["request_id"] == f"{traj}-1"
+    # p3 与 p2 contents 完全相同 → 实抓语义下是一次客户端重发
+    # (163547:0013 502 失败后 0014 原样重发,step +1)→ step 6
+    assert rid3.split("/")[4] == "6"
+    assert p3["request"]["labels"]["last_step_index"] == "5"
 
 
 async def test_tool_round_step_matches_real_sample():
-    """实抓 20261121-112701/0011（真实客户端形态）：user + model(functionCall) +
-    model(functionResponse)（functionResponse 的 role=model）→ requestId 末段 3、
-    last_step_index 2、request_id 后缀从 0 开始。
+    """实抓 163547 工具轮形态:user + model(fc) + model(fr) → 自然步号
+    = 1 user + 1 fc 轮 + 1 fc part = 3,requestId 末段 3、last_step_index 2、
+    request_id 后缀从 0 开始。
 
-    step 规律：functionResponse 不计入 model 轮（工具输出不是模型回复）。
+    step 规律:functionResponse 不计轮(工具输出不是模型回复)。
     """
     request = _req([
         {"role": "user", "parts": [{"text": "读一下探测文件"}]},
@@ -147,9 +150,38 @@ async def test_tool_round_step_matches_real_sample():
     assert payload["request"]["labels"]["request_id"].endswith("-0")
 
 
+async def test_step_counts_parallel_calls_per_part():
+    """实抓 163547/0020 形态:user + model(fc×2) + model(fr×2) → 自然步号
+    = 1 user + 1 fc 轮 + 2 fc part = 4(并行调用按 part 数计,fr 不计)。
+
+    旧公式 1+2×model轮=3 会漏掉并行调用的差异;该差异只在真实转发会话暴露。
+    """
+    request = _req([
+        {"role": "user", "parts": [{"text": "并行读两个文件"}]},
+        {
+            "role": "model",
+            "parts": [
+                {"functionCall": {"name": "read_file", "args": {"Path": "a"}}},
+                {"functionCall": {"name": "read_file", "args": {"Path": "b"}}},
+            ],
+        },
+        {
+            "role": "model",
+            "parts": [
+                {"functionResponse": {"name": "read_file", "response": {"output": "a"}}},
+                {"functionResponse": {"name": "read_file", "response": {"output": "b"}}},
+            ],
+        },
+    ])
+    payload, rid = await wrap_cli_request(request, MODEL, "proj")
+    assert rid.split("/")[4] == "4"
+    assert payload["request"]["labels"]["last_step_index"] == "3"
+
+
 async def test_step_excludes_function_response_rounds():
-    """实抓 20261121-114847/0016 形态:[user, model(fc), model(fr), model(text), user]
-    → step=5(fr 不计轮)。若裸数 role==model 会错算成 7。"""
+    """实抓 163547 文本收尾形态:[user, model(fc), model(fr), model(text), user]
+    → 自然步号 = 2 user + 1 fc 轮 + 1 text 轮 + 1 fc part = 5(fr 不计轮)。
+    若裸数 role==model 会错算成 7。"""
     request = _req([
         {"role": "user", "parts": [{"text": "查一下"}]},
         {"role": "model", "parts": [{"functionCall": {"name": "read_file", "args": {"Path": "x"}}}]},
@@ -167,6 +199,79 @@ async def test_shared_system_sessions_isolated():
     pb, _ = await wrap_cli_request(_session_b(), MODEL, "proj")
     assert pa["request"]["sessionId"] != pb["request"]["sessionId"]
     assert pa["request"]["labels"]["trajectory_id"] != pb["request"]["labels"]["trajectory_id"]
+
+
+def _tool_cycle_history(*, with_text_tail: bool):
+    """构造一个完整工具周期历史:user → fc → fr → [text]。"""
+    contents = [
+        {"role": "user", "parts": [{"text": "查一下"}]},
+        {"role": "model", "parts": [{"functionCall": {"name": "read_file", "id": "c1", "args": {"Path": "x"}}}]},
+        {"role": "model", "parts": [{"functionResponse": {"name": "read_file", "id": "c1", "response": {"output": "ok"}}}]},
+    ]
+    if with_text_tail:
+        contents.append({"role": "model", "parts": [{"text": "结果是……"}]})
+    return contents
+
+
+async def test_last_execution_id_absent_without_fr_before_last_user():
+    """无工具执行 → 九键;fr 在最后一个 user 轮之后(纯工具续跑)→ 九键。
+
+    实抓 163547:0013-0067(第一个 user 周期内的工具续跑)全部九键,
+    0074(新 user 轮开启且此前有工具执行)才出现 last_execution_id。
+    """
+    p, _ = await wrap_cli_request(_req(_session_a_turn1()["contents"]), MODEL, "proj")
+    assert "last_execution_id" not in p["request"]["labels"]
+
+    tool_run = _req([
+        {"role": "user", "parts": [{"text": "查一下"}]},
+        {"role": "model", "parts": [{"functionCall": {"name": "read_file", "id": "c1", "args": {"Path": "x"}}}]},
+        {"role": "model", "parts": [{"functionResponse": {"name": "read_file", "id": "c1", "response": {"output": "ok"}}}]},
+    ])
+    p2, _ = await wrap_cli_request(tool_run, MODEL, "proj")
+    assert "last_execution_id" not in p2["request"]["labels"]
+
+
+async def test_last_execution_id_appears_after_tool_cycle():
+    """工具周期结束 + 新 user 轮 → 十键,键序在 cascade_id 之后(实抓 0074 形态)。"""
+    contents = _tool_cycle_history(with_text_tail=True)
+    contents.append({"role": "user", "parts": [{"text": "继续"}]})
+    p, _ = await wrap_cli_request(_req(contents), MODEL, "proj")
+    labels = p["request"]["labels"]
+    assert "last_execution_id" in labels
+    assert list(labels.keys())[:2] == ["cascade_id", "last_execution_id"]
+    # 值为合法 uuid v4 形态
+    value = uuid.UUID(labels["last_execution_id"])
+    assert value.version == 4
+
+
+async def test_last_execution_id_stable_within_cycle_then_refreshes():
+    """同一工具轮在同一 user 周期内保持同值;新 user 轮引用新工具轮后更替。
+
+    实抓 163547:0074/0077/0078 同值 X,0080/0083/0084/0085 同值 Z,X≠Z。
+    """
+    contents_a = _tool_cycle_history(with_text_tail=True)
+    contents_a.append({"role": "user", "parts": [{"text": "继续"}]})
+    pa, _ = await wrap_cli_request(_req(contents_a), MODEL, "proj")
+    lei_a = pa["request"]["labels"]["last_execution_id"]
+
+    # 同一周期内工具续跑(fr 结尾):值保持不变(实抓 0077/0078)
+    contents_b = _tool_cycle_history(with_text_tail=True)
+    contents_b.append({"role": "user", "parts": [{"text": "继续"}]})
+    contents_b.append({"role": "model", "parts": [{"functionCall": {"name": "write_file", "id": "c2", "args": {"Path": "y"}}}]})
+    contents_b.append({"role": "model", "parts": [{"functionResponse": {"name": "write_file", "id": "c2", "response": {"output": "ok"}}}]})
+    pb, _ = await wrap_cli_request(_req(contents_b), MODEL, "proj")
+    assert pb["request"]["labels"]["last_execution_id"] == lei_a
+
+    # 新 user 轮引用新工具轮(fr 轮在最后一个 user 轮之前更替):值更替(实抓 0080)
+    contents_c = contents_b + [{"role": "model", "parts": [{"text": "改好了"}]},
+                               {"role": "user", "parts": [{"text": "再看一遍"}]}]
+    pc, _ = await wrap_cli_request(_req(contents_c), MODEL, "proj")
+    lei_c = pc["request"]["labels"]["last_execution_id"]
+    assert lei_c != lei_a
+
+    # 更替后的周期内续跑再次保持同值(实抓 0083-0085)
+    pd, _ = await wrap_cli_request(_req(contents_c), MODEL, "proj")
+    assert pd["request"]["labels"]["last_execution_id"] == lei_c
 
 
 async def test_different_model_isolated():
@@ -210,7 +315,8 @@ async def test_labels_and_request_type_unchanged():
     assert labels["cascade_id"] == labels["root_cascade_id"]
     assert labels["cascade_id"] == p["requestId"].split("/")[1]
     assert labels["trajectory_id"] == p["requestId"].split("/")[3]
-    # 2.34.0 起真实客户端不再发送 last_execution_id
+    # 无工具执行轮的会话(纯文本)为九键形态:该键整体不出现
+    # (实抓 163547:0013-0067 九键,0074 起工具执行后十键)
     assert "last_execution_id" not in labels
     assert labels["used_claude"] == "false"
     assert labels["used_non_gemini_model"] == "false"
@@ -262,13 +368,15 @@ def test_generate_request_id_format():
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+# 唯一实抓基准:163547 = 转发模式真实开发会话(owner 2026-11-21 指正,
+# 114847 等旧会话为离线模拟,不作地面真值)。0080 为十键 labels 形态。
 _CAPTURE_SAMPLE = (
     _REPO_ROOT
     / "tools"
     / "antigravity_capture"
     / "captures"
-    / "20261121-114847"
-    / "0014_streamGenerateContent.request.bin"
+    / "20261121-163547"
+    / "0080_streamGenerateContent.request.bin"
 )
 
 
@@ -277,14 +385,17 @@ _CAPTURE_SAMPLE = (
     reason="缺少实抓样本（tools/antigravity_capture/captures 已被 gitignore）",
 )
 async def test_envelope_matches_captured_sample_shape():
-    """与实抓报文（114847/0014，工具轮九键形态）做结构级黄金对照
-    （不比较 UUID / 时间戳等易变值）。"""
+    """与实抓报文（163547/0080，工具周期后新 user 轮的十键形态）做结构级
+    黄金对照（不比较 UUID / 时间戳等易变值）。"""
     sample = json.loads(_CAPTURE_SAMPLE.read_text(encoding="utf-8"))
-    payload, _rid = await wrap_cli_request(_session_a_turn3(), "gemini-3-pro-preview", "proj")
+    # 构造与实抓同构的十键形态:工具周期 + 文本收尾 + 新 user 轮
+    contents = _tool_cycle_history(with_text_tail=True)
+    contents.append({"role": "user", "parts": [{"text": "继续"}]})
+    payload, _rid = await wrap_cli_request(_req(contents), MODEL, "proj")
 
     # 顶层信封键序一致
     assert list(payload.keys()) == list(sample.keys())
-    # labels 键序与键集一致
+    # labels 键序与键集一致(十键)
     assert list(payload["request"]["labels"].keys()) == list(
         sample["request"]["labels"].keys()
     )

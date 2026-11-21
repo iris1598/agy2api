@@ -830,7 +830,7 @@ def _strip_trailing_model_turns(contents: List[Any]) -> Tuple[List[Any], int]:
     """循环移除末尾的 model 消息，保证以用户消息结尾。
 
     含 functionResponse 的 model 消息不剥离：那是用户侧提供的工具输出
-    （实抓 2.34.0/114847/0014：真实客户端以 role=model 的 functionResponse
+    （实抓 2.34.0/163547/0077：真实客户端以 role=model 的 functionResponse
     结尾请求续跑），不是预填充的模型回复。
     """
     contents = list(contents)

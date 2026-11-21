@@ -128,28 +128,177 @@ def _generate_request_id(cascade_id: str, step: int, trajectory_id: str) -> str:
     return f"agent/{conversation}/{ts_ms}/{trajectory_id}/{step}"
 
 
-# 轨迹请求计数（labels.request_id 后缀）：实测同一 trajectory 内逐请求自增，
-# 与 step 无关。进程内维护，重启归零可接受；LRU 限制避免长期运行时无限增长。
-_TRAJECTORY_REQUEST_SEQ: "OrderedDict[str, int]" = OrderedDict()
-_TRAJECTORY_REQUEST_SEQ_LOCK = threading.Lock()
+# 轨迹计数器(labels.request_id 自增后缀 + step 重发修正):进程内维护,
+# 重启归零可接受;LRU 限制避免长期运行时无限增长。
+@dataclass
+class _TrajectoryCounters:
+    """同一 trajectory 的进程内计数状态。
+
+    - request_seq:labels.request_id 后缀(实抓从 0 开始逐请求自增);
+    - last_natural/bumps/last_step:step 的重发修正状态。实抓(163547)
+      证明 step 不是纯 contents 函数——0013 请求 502 失败后客户端原样重发
+      (0014),step 从 1 抬到 2 且此后该轨迹 31 条请求全部带这个 +1。
+      contents 未推进的自然步号视为一次重发,累计偏移。
+    """
+
+    request_seq: int = -1
+    last_natural: Optional[int] = None
+    bumps: int = 0
+    last_step: int = 0
+
+
+_TRAJECTORY_COUNTERS: "OrderedDict[str, _TrajectoryCounters]" = OrderedDict()
+_TRAJECTORY_COUNTERS_LOCK = threading.Lock()
 _MAX_TRACKED_TRAJECTORIES = 2048
 
 
 def _reset_trajectory_request_seq() -> None:
-    """清空轨迹请求计数（仅供测试）。"""
-    with _TRAJECTORY_REQUEST_SEQ_LOCK:
-        _TRAJECTORY_REQUEST_SEQ.clear()
+    """清空轨迹计数器(仅供测试;覆盖 request_seq 与 step 重发状态)。"""
+    with _TRAJECTORY_COUNTERS_LOCK:
+        _TRAJECTORY_COUNTERS.clear()
+
+
+def _reset_trajectory_step_state() -> None:
+    """仅清空 step 重发状态(仅供测试)。"""
+    with _TRAJECTORY_COUNTERS_LOCK:
+        for state in _TRAJECTORY_COUNTERS.values():
+            state.last_natural = None
+            state.bumps = 0
+            state.last_step = 0
+
+
+def _seed_trajectory_step_state(trajectory_id: str, *, bumps: int) -> None:
+    """预置轨迹的 step 重发偏移(仅供测试做实抓复放)。"""
+    with _TRAJECTORY_COUNTERS_LOCK:
+        state = _TRAJECTORY_COUNTERS.get(trajectory_id)
+        if state is None:
+            state = _TrajectoryCounters()
+            _TRAJECTORY_COUNTERS[trajectory_id] = state
+        state.bumps = bumps
+
+
+def _get_or_create_counters(trajectory_id: str) -> _TrajectoryCounters:
+    """取出(或创建)轨迹计数状态并做 LRU 维护。持锁调用。"""
+    state = _TRAJECTORY_COUNTERS.get(trajectory_id)
+    if state is None:
+        state = _TrajectoryCounters()
+        _TRAJECTORY_COUNTERS[trajectory_id] = state
+    _TRAJECTORY_COUNTERS.move_to_end(trajectory_id)
+    while len(_TRAJECTORY_COUNTERS) > _MAX_TRACKED_TRAJECTORIES:
+        _TRAJECTORY_COUNTERS.popitem(last=False)
+    return state
 
 
 def _next_trajectory_request_seq(trajectory_id: str) -> int:
-    """同一 trajectory 的 labels.request_id 自增计数（实抓从 0 开始）。"""
-    with _TRAJECTORY_REQUEST_SEQ_LOCK:
-        seq = _TRAJECTORY_REQUEST_SEQ.get(trajectory_id, -1) + 1
-        _TRAJECTORY_REQUEST_SEQ[trajectory_id] = seq
-        _TRAJECTORY_REQUEST_SEQ.move_to_end(trajectory_id)
-        while len(_TRAJECTORY_REQUEST_SEQ) > _MAX_TRACKED_TRAJECTORIES:
-            _TRAJECTORY_REQUEST_SEQ.popitem(last=False)
-        return seq
+    """同一 trajectory 的 labels.request_id 自增计数(实抓从 0 开始)。"""
+    with _TRAJECTORY_COUNTERS_LOCK:
+        state = _get_or_create_counters(trajectory_id)
+        state.request_seq += 1
+        return state.request_seq
+
+
+def _resolve_trajectory_step(trajectory_id: str, natural: int) -> int:
+    """轨迹级 step 解析:自然步号 + 重发偏移(实抓 163547 全序列拟合)。
+
+    自然步号(纯 contents 决定)不小于上一请求时为正常推进,step =
+    自然步号 + 累计偏移;contents 未推进(<= 上一次)视为客户端重发,
+    偏移 +1 且 step 至少前进 1(实抓 0013→0014 的 502 重发行为)。
+    """
+    with _TRAJECTORY_COUNTERS_LOCK:
+        state = _get_or_create_counters(trajectory_id)
+        if state.last_natural is not None and natural <= state.last_natural:
+            state.bumps += 1
+            step = max(natural + state.bumps, state.last_step + 1)
+        else:
+            step = natural + state.bumps
+        state.last_natural = natural
+        state.last_step = step
+        return step
+
+
+def _natural_step(contents: Any) -> int:
+    """step 的 contents 决定部分(实抓 163547,33 条 agent 请求全序列拟合):
+
+        step = user 轮数 + 非(纯 functionResponse)的 model 轮数
+               + functionCall part 数
+
+    实抓对照(trajectory d5cdfe46):
+        0013 [user]                                  → 自然 1(实测 1)
+        0020 [user, model(fc×2), model(fr×2)]        → 自然 4(实测 5,含重发偏移 1)
+        0029 [user + 4×(fc 轮,fr 轮)]                → 自然 14(实测 15,同上)
+        0074 [..., model(text), user]                → 自然 68(实测 69,同上)
+        0085 末尾状态                                 → 自然 86(实测 87,同上)
+    旧公式 1 + 2×model 轮在"每轮恰好 1 次调用"时与它巧合相等(114847 离线
+    样本全部落在该巧合区),163547 的并行调用/多轮历史暴露了差异。
+    """
+    user_turns = 0
+    model_turns = 0
+    fc_parts = 0
+    if not isinstance(contents, list):
+        return 0
+    for content in contents:
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        role = content.get("role")
+        if role == "user":
+            user_turns += 1
+        elif role == "model":
+            fc_parts += sum(
+                1 for part in parts if isinstance(part, dict) and "functionCall" in part
+            )
+            # 纯 functionResponse 内容是工具输出,不计轮(functionResponse 不计轮)
+            if parts and not all(
+                isinstance(part, dict) and "functionResponse" in part for part in parts
+            ):
+                model_turns += 1
+    return user_turns + model_turns + fc_parts
+
+
+def _resolve_last_execution_id(contents: Any, trajectory_id: str) -> str:
+    """确定性解析 labels.last_execution_id(无工具执行轮时返回空串)。
+
+    实抓结论(163547,唯一真实转发基准):
+    - 该值由客户端本地生成(uuid4),不出现在任何上游响应中;
+    - 出现规律:存在位于"最后一个 user 轮"之前的 functionResponse 轮时,
+      请求携带该键;同一工具轮在同一 user 周期内的后续请求保持同值,
+      新 user 轮开启后切换为最新工具轮的 id(0074-0078 同值 X,
+      0080-0085 同值 Z,X≠Z;0020-0067 工具续跑但无新 user 轮之前不携带)。
+    - 代理无法复现客户端本地随机值,改用确定性派生:对 (trajectory_id,
+      最后一个 user 轮之前最后一个 fr 轮的内容)做 sha256 → uuid v4 形态。
+      历史中同一 fr 轮逐字节相同 → 值稳定;开启新 user 轮引用新 fr 轮 →
+      值更替,与实抓的稳定性模式逐请求一致。
+    """
+    if not isinstance(contents, list) or not trajectory_id:
+        return ""
+    last_user_index = -1
+    fr_indexes = []
+    for index, content in enumerate(contents):
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if content.get("role") == "user":
+            last_user_index = index
+        elif content.get("role") == "model" and isinstance(parts, list) and any(
+            isinstance(part, dict) and "functionResponse" in part for part in parts
+        ):
+            fr_indexes.append(index)
+    if last_user_index < 0 or not fr_indexes:
+        return ""
+    # 只取"最后一个 user 轮之前"的 fr 轮:之后的轮属于新周期尚未被
+    # user 轮引用(实抓 0083-0085 的 lei 仍是 0080 时点的值)
+    earlier = [index for index in fr_indexes if index < last_user_index]
+    if not earlier:
+        return ""
+    canonical = json.dumps(
+        contents[earlier[-1]], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    digest = hashlib.sha256(
+        trajectory_id.encode("utf-8") + b"|last_execution|" + canonical.encode("utf-8")
+    ).digest()
+    return str(uuid.UUID(bytes=digest[:16], version=4))
 
 
 def _build_labels(
@@ -159,23 +308,30 @@ def _build_labels(
     *,
     cascade_id: str,
     request_seq: int,
+    last_execution_id: str = "",
 ) -> Dict[str, str]:
     """构建官方上下文标签元数据（键序按官方字母序排布）。
 
-    实抓样本（2026-11-21，language_server 2.34.0，streamGenerateContent）：
+    实抓样本（2026-11-21 163547 会话，language_server 2.34.0，转发模式真实
+    会话 0080 号请求，十键形态）：
     {
-      "cascade_id": "5c6b5422-381c-406b-ab6b-f22fad9f7bff",
-      "last_step_index": "8",
+      "cascade_id": "9120a56d-...",
+      "last_execution_id": "8d00538a-...",   ← 仅在存在工具执行轮时出现
+      "last_step_index": "76",
       "model_enum": "MODEL_PLACEHOLDER_M526",
-      "request_id": "3ca3a2de-ad5c-4bbd-94f2-0a6cdca924c0-2",
-      "root_cascade_id": "afb38f6a-74b6-459f-8edd-a75d8d00bc19",
-      "trajectory_id": "3ca3a2de-ad5c-4bbd-94f2-0a6cdca924c0",
+      "request_id": "d5cdfe46-...-N",
+      "root_cascade_id": "9120a56d-...",
+      "trajectory_id": "d5cdfe46-...",
       "used_claude": "false",
       "used_claude_conservative": "false",
       "used_non_gemini_model": "false"
     }
 
     - ``last_step_index`` = 当前步索引 - 1（实测 requestId 末段 = 它 + 1）；
+    - ``last_execution_id``：客户端本地生成的工具执行标识（uuid4，不出现在
+      任何上游响应里）。存在位于最后一个 user 轮之前的 functionResponse 轮
+      时携带（键序在 cascade_id 之后、last_step_index 之前，字母序）；无工具
+      执行的会话为九键形态，键整体不出现（空串由调用方剥除）；
     - ``model_enum`` 是内部枚举值而非模型名（见 src/model_enum.py）；
     - ``request_id`` 后缀是 trajectory 内逐请求自增计数，不是 step。
     """
@@ -186,6 +342,7 @@ def _build_labels(
     root_cascade_id = cascade_id
     return {
         "cascade_id": cascade_id,
+        "last_execution_id": last_execution_id,
         "last_step_index": str(max(step - 1, 0)),
         "model_enum": resolve_model_enum(model),
         "request_id": f"{trajectory_id}-{request_seq}",
@@ -277,7 +434,7 @@ class EnvelopeParts:
     """
 
     inner_entries: List[Tuple[str, Any]]  # 有序 (key, value);labels 位为 (key, None) 占位
-    labels: Dict[str, str]                # 九键 labels 值(_build_labels 产物,Python 作曲用)
+    labels: Dict[str, str]                # labels 值(九键或十键,_build_labels 产物,Python 作曲用)
     anchors: Dict[str, Any]               # Go envelopeAnchors 所需的 camelCase 值
     model: str
     request_type: str
@@ -336,37 +493,23 @@ async def build_envelope_parts(
         )
         inner["sessionId"] = session_id
 
-    # step：实抓规律为 step = 1 + 2 × (model 轮数)。
-    # "model 轮"= 一次模型回复（最终文本或 functionCall），**functionResponse
-    # 不算轮**——它是用户侧提供的工具输出，不是一次模型回复。
-    # 实抓证据（2.34.0，工具正常的最末会话，owner 2026-11-21 指正：
-    # 101457/101904 两个长序列是工具损坏导致的重试风暴，不作数）：
-    #   114847/0010 [user]                                    → step=1
-    #   114847/0014 [user, model(fc), model(fr)]              → step=3（fr 不计）
-    #   114847/0016 [user, model(fc), model(fr), model(text),
-    #                user]                                     → step=5
-    #   112701/0011 [user, model(fc), model(fr)]              → step=3
-    # 即同一轨迹内每完成一轮交互 step+2；labels.last_step_index = step - 1。
-    # 注意裸数 role=="model" 的旧公式在含 functionResponse 的历史上会多算。
-    def _is_model_response_turn(content: Any) -> bool:
-        if not (isinstance(content, dict) and content.get("role") == "model"):
-            return False
-        parts = content.get("parts") or []
-        # 仅由 functionResponse 组成的内容是工具输出，不计入轮数
-        return not all(
-            isinstance(part, dict) and "functionResponse" in part for part in parts
-        ) if parts else False
-
-    model_turns = 0
-    contents = inner.get("contents")
-    if isinstance(contents, list):
-        model_turns = sum(1 for content in contents if _is_model_response_turn(content))
-    step = 1 + 2 * model_turns
+    # step：实抓规律（163547 真实转发会话，33 条 agent 请求全序列拟合）：
+    #   自然步号 = user 轮数 + 非(纯 functionResponse)的 model 轮数
+    #              + functionCall part 数（fr 不计轮；并行调用按 part 数计）。
+    #   轨迹内再叠加"重发偏移"：contents 未推进的重复请求视为一次客户端
+    #   重发（实抓 0013 请求 502 失败 → 0014 原样重发，step 1→2，此后该
+    #   轨迹 31 条请求全部带这个 +1 偏移）。见 _natural_step /
+    #   _resolve_trajectory_step。labels.last_step_index = step - 1。
+    # 真实客户端 contents 至少一条 user 轮，实抓最小 step 为 1；空 contents
+    # 是代理兼容性兜底路径，取下限 1 保持 requestId 末段形态。
+    natural_step = max(_natural_step(inner.get("contents")), 1)
 
     # cascadeId / trajectoryId 与 sessionId 同源确定性派生（无锚点时各自随机兜底），
     # 兜底在这里生成——两种作曲模式（Go / Python）拿到完全相同的锚点
     trajectory_id = derived_ids.trajectory_id or str(uuid.uuid4())
     cascade_id = derived_ids.cascade_id or str(uuid.uuid4())
+
+    step = _resolve_trajectory_step(trajectory_id, natural_step)
 
     # thoughtSignature 回注：真实客户端会把上一轮签名带回；兼容客户端常丢弃。
     # 只补回本轨迹确实见过的签名，不伪造。
@@ -374,13 +517,19 @@ async def build_envelope_parts(
 
     # labels 值（键序/键集完全对齐实抓样本；last_step_index = step - 1）。
     # 值单一来源在这里算好;字节由作曲方(Go / Python)产出
+    last_execution_id = _resolve_last_execution_id(inner.get("contents"), trajectory_id)
     labels = _build_labels(
         model,
         trajectory_id,
         step,
         cascade_id=cascade_id,
         request_seq=_next_trajectory_request_seq(trajectory_id),
+        last_execution_id=last_execution_id,
     )
+    if not labels.get("last_execution_id"):
+        # 无工具执行轮的会话为九键形态(实抓 163547:0013-0067 不携带该键);
+        # pop 保持其余键序不变
+        labels.pop("last_execution_id")
     # labels 注入内层(位置由拓扑对齐决定:toolConfig 之后、generationConfig 之前);
     # 值片序列里会替换为占位,字节由作曲方产出
     inner["labels"] = labels
@@ -395,6 +544,8 @@ async def build_envelope_parts(
         "usedClaude": labels["used_claude"],
         "usedClaudeConservative": labels["used_claude_conservative"],
         "usedNonGeminiModel": labels["used_non_gemini_model"],
+        # 空串时 Go 侧以 omitempty 整键剥除(九键形态)
+        "lastExecutionId": labels.get("last_execution_id", ""),
     }
 
     # requestType 与 toolConfig 对齐官方 agent 状态机：

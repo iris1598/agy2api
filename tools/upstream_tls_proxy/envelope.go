@@ -1,7 +1,7 @@
 // 信封构造:上游报文字节的唯一作者。
 //
 // Python 只传"内层有序值片 + 会话锚点 + 模型",所有结构字节——内层帧、
-// labels 九键、requestId 五段、外层六键信封——由本文件产出。内层值片是
+// labels(九键或十键)、requestId 五段、外层六键信封——由本文件产出。内层值片是
 // Python 用与 httpx 相同参数(ensure_ascii=False, separators=(",",":"),
 // allow_nan=False)json.dumps 出的原始字节,本文件只做纯拼接,绝不重新
 // 序列化,保证最终报文与 Python 直连路径的字节逐字节一致。
@@ -13,9 +13,6 @@
 // 键序对齐实抓(2.34.0):
 //   内层: contents → systemInstruction → tools → toolConfig → labels →
 //         generationConfig → sessionId → 其余(顺序由 Python 的有序值片给出)
-//   labels: cascade_id → last_step_index → model_enum → request_id →
-//           root_cascade_id → trajectory_id → used_claude →
-//           used_claude_conservative → used_non_gemini_model(字母序)
 //   信封: project → requestId → request → model → userAgent → requestType
 package main
 
@@ -32,9 +29,17 @@ import (
 // 该键不会与合法值片冲突。
 const envelopeLabelsPlaceholder = "labels"
 
+// 实抓键序对照(2.34.0,163547 真实转发会话):
+//   labels: cascade_id → [last_execution_id] → last_step_index → model_enum →
+//           request_id → root_cascade_id → trajectory_id → used_claude →
+//           used_claude_conservative → used_non_gemini_model(字母序;
+//           last_execution_id 仅在存在工具执行轮时出现)
+
 // 上游信封协议版本(/__health 的 "protocol" 字段;Python 侧强校验,
 // 不匹配则拒绝启动/请求,防止旧二进制静默产出错误报文)。
-const envelopeProtocolVersion = 2
+// v3: anchors 新增 lastExecutionId(labels 可选第十键 last_execution_id,
+// 实抓 163547/0074-0085;v2 二进制会静默丢键,必须拒绝)。
+const envelopeProtocolVersion = 3
 
 type envelopeInput struct {
 	Model        string               `json:"model"`
@@ -58,6 +63,7 @@ type envelopeAnchors struct {
 	UsedClaude             string `json:"usedClaude"`
 	UsedClaudeConservative string `json:"usedClaudeConservative"`
 	UsedNonGeminiModel     string `json:"usedNonGeminiModel"`
+	LastExecutionID        string `json:"lastExecutionId"` // labels.last_execution_id 值,空串=不带该键
 }
 
 type envelopeInnerEntry struct {
@@ -96,9 +102,11 @@ func (e *envelopeInnerEntry) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// envelopeLabels 九键,字段声明序 = 实抓键序(字母序)。
+// envelopeLabels 键序 = 实抓键序(字母序;last_execution_id 仅在有值时
+// 出现,位于 cascade_id 之后,实抓 163547/0074-0085 十键形态)。
 type envelopeLabels struct {
 	CascadeID              string `json:"cascade_id"`
+	LastExecutionID        string `json:"last_execution_id,omitempty"`
 	LastStepIndex          string `json:"last_step_index"`
 	ModelEnum              string `json:"model_enum"`
 	RequestID              string `json:"request_id"`
@@ -146,9 +154,10 @@ func buildEnvelope(raw []byte) ([]byte, error) {
 		return nil, errors.New("envelope input has no inner entries")
 	}
 
-	// 1. labels 九键(值来自锚点,均为 ASCII:uuid/枚举/"true"/"false"/数字串)。
+	// 1. labels 键序对齐实抓(值来自锚点,均为 ASCII:uuid/枚举/"true"/"false"/数字串)。
 	labels := envelopeLabels{
 		CascadeID:              input.Anchors.CascadeID,
+		LastExecutionID:        input.Anchors.LastExecutionID,
 		LastStepIndex:          input.Anchors.LastStepIndex,
 		ModelEnum:              input.Anchors.ModelEnum,
 		RequestID:              input.Anchors.RequestIDLabel,

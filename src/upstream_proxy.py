@@ -42,9 +42,11 @@ _MONITOR_INTERVAL = 15.0
 
 # 转发器协议版本(/__health 的 "protocol" 字段,见 envelope.go):
 # v2 = 信封模式(X-Upstream-Build-Envelope,报文唯一作者在 Go)。
+# v3 = anchors 新增 lastExecutionId(labels 可选第十键 last_execution_id,
+#      实抓 163547/0074-0085;v2 二进制会静默丢键,必须拒绝)。
 # 本进程拉起的二进制在启动后立即校验;旧二进制直接判不可用,
 # 严格模式下拒绝启动,防止静默产出错误报文。
-REQUIRED_FORWARDER_PROTOCOL = 2
+REQUIRED_FORWARDER_PROTOCOL = 3
 
 _lock = threading.Lock()
 _process: Optional[subprocess.Popen] = None

@@ -36,7 +36,9 @@ import pytest  # noqa: E402
 from src import upstream_proxy  # noqa: E402
 from src.api.antigravity import (  # noqa: E402
     UPSTREAM_BUILD_ENVELOPE_HEADER,
+    _derive_upstream_session_ids,
     _reset_trajectory_request_seq,
+    _seed_trajectory_step_state,
     build_envelope_parts,
     compose_python_envelope,
     compose_sidecar_body,
@@ -44,21 +46,19 @@ from src.api.antigravity import (  # noqa: E402
 
 MODEL = "gemini-4-carbon-medium"
 
-# 实抓黄金样本:2.34.0 真实 agent 形态信封(gemini-4-hydrogen-medium,
-# 工具轮 [user, model(fc), model(fr)] → step=3,labels 九键,
-# generationConfig 含 MEDIUM thinking;owner 指正:取工具正常的最新会话,
-# 101457/101904 长序列为重试风暴不作数)
+# 实抓黄金样本:163547 会话(转发模式真实开发会话,owner 2026-11-21 指正为
+# 唯一实抓基准;114847 等旧会话为离线模拟不作地面真值)0080 号请求:
+# 工具周期 + 文本收尾 + 新 user 轮的十键 labels 形态(含 last_execution_id),
+# requestId 末段 77 = 自然步号 76 + 重发偏移 1(0013 请求 502 失败后客户端
+# 原样重发,轨迹 step 永久 +1,复放时用 _seed_trajectory_step_state 预置)。
 _CAPTURE_SAMPLE = (
     REPO_ROOT
     / "tools"
     / "antigravity_capture"
     / "captures"
-    / "20261121-114847"
-    / "0014_streamGenerateContent.request.bin"
+    / "20261121-163547"
+    / "0080_streamGenerateContent.request.bin"
 )
-
-# 特殊字符覆盖:中文、引号、反斜杠、换行、<>&(Go 默认 HTML 转义,必须关闭)
-_SPECIAL_TEXT = "你好\"world\"\n第二行\\slash<>&tail"
 
 # 特殊字符覆盖:中文、引号、反斜杠、换行、<>&(Go 默认 HTML 转义,必须关闭)
 _SPECIAL_TEXT = "你好\"world\"\n第二行\\slash<>&tail"
@@ -168,7 +168,8 @@ def test_captured_raw_body_is_compact():
 
 
 def _normalize_envelope(env: dict) -> str:
-    """实抓对照的动态值归一(uuid/时间戳/sessionId),键序与其余值逐字节保留。"""
+    """实抓对照的动态值归一(uuid/时间戳/sessionId/last_execution_id),
+    键序与其余值逐字节保留。"""
     env = copy.deepcopy(env)
     env["requestId"] = "<REQID>"
     request = env["request"]
@@ -176,7 +177,15 @@ def _normalize_envelope(env: dict) -> str:
         request["sessionId"] = "<SID>"
     labels = request.get("labels")
     if isinstance(labels, dict):
-        for key in ("cascade_id", "request_id", "root_cascade_id", "trajectory_id"):
+        for key in (
+            "cascade_id",
+            "request_id",
+            "root_cascade_id",
+            "trajectory_id",
+            # last_execution_id 是客户端本地生成的随机标识,代理以确定性
+            # 派生值替代(结构同为 uuid v4);键的存在与位置由键序断言守住
+            "last_execution_id",
+        ):
             if key in labels:
                 labels[key] = "<UUID>"
     return json.dumps(env, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
@@ -202,6 +211,13 @@ def test_go_envelope_matches_captured_sample(forwarder, dummy_upstream):
         for key, value in captured_request.items()
         if key not in ("labels", "sessionId")
     }
+    # 复放实抓轨迹的 step 重发偏移:实抓 0013 请求 502 失败后客户端原样重发
+    # (0014),此后该轨迹 31 条请求 step 全部 +1;黄金样本 0080 末段 77 =
+    # 自然步号 76 + 偏移 1。轨迹 id 与管线派生口径一致(锚点同源)。
+    trajectory_id = _derive_upstream_session_ids(
+        client_request, sample["model"]
+    ).trajectory_id
+    _seed_trajectory_step_state(trajectory_id, bumps=1)
     parts = asyncio.run(build_envelope_parts(client_request, sample["model"], sample["project"]))
     wrapper = json.dumps(
         compose_sidecar_body(parts), ensure_ascii=False, separators=(",", ":"), allow_nan=False
@@ -227,9 +243,10 @@ def test_go_envelope_matches_captured_sample(forwarder, dummy_upstream):
     assert list(go_env["request"].keys()) == list(captured_request.keys()), "内层键序与实抓不一致"
     assert list(go_env["request"]["labels"].keys()) == list(
         captured_request["labels"].keys()
-    ), "labels 九键序与实抓不一致"
+    ), "labels 键序与实抓不一致"
 
-    # requestId:第 1 段 agent、末段 step 与实抓完全一致(实抓 593 = 1 + 2×296)
+    # requestId:第 1 段 agent、末段 step 与实抓完全一致
+    # (实抓 0080 末段 77 = 自然步号 76 + 实抓轨迹重发偏移 1)
     go_segments = go_env["requestId"].split("/")
     sample_segments = sample["requestId"].split("/")
     assert go_segments[0] == sample_segments[0] == "agent"
@@ -294,6 +311,70 @@ def test_go_envelope_bytes_match_python_reference(forwarder, dummy_upstream):
         f"\n--- Go 实际 ---\n{actual_normalized[:800].decode('utf-8', 'replace')}"
         f"\n--- Python 期望 ---\n{expected[:800].decode('utf-8', 'replace')}"
     )
+
+
+def _tool_cycle_request():
+    """带工具周期 + 新 user 轮的历史 → 触发十键 labels(last_execution_id)。"""
+    return {
+        "contents": [
+            {"role": "user", "parts": [{"text": "查一下配置"}]},
+            {"role": "model", "parts": [{"functionCall": {"name": "read_file", "id": "c1", "args": {"Path": "x"}}}]},
+            {"role": "model", "parts": [{"functionResponse": {"name": "read_file", "id": "c1", "response": {"output": "ok"}}}]},
+            {"role": "model", "parts": [{"text": "结果如下"}]},
+            {"role": "user", "parts": [{"text": _SPECIAL_TEXT}]},
+        ],
+        "tools": [
+            {"functionDeclarations": [{"name": "read_file", "parameters": {"type": "object"}}]}
+        ],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 65536},
+    }
+
+
+def _run_go_envelope(forwarder, dummy_upstream, parts):
+    """把 parts 经 sidecar wrapper 送入 Go 转发器,返回构造的上游报文 dict。"""
+    wrapper = compose_sidecar_body(parts)
+    resp = httpx.post(
+        f"{forwarder}/v1internal:generateContent",
+        content=json.dumps(
+            wrapper, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Upstream-URL": f"{dummy_upstream}/v1internal:generateContent",
+            UPSTREAM_BUILD_ENVELOPE_HEADER: "1",
+        },
+        timeout=30.0,
+    )
+    assert resp.status_code == 200, resp.text
+    assert _Recorder.received
+    return json.loads(_Recorder.received[-1][1])
+
+
+def test_go_envelope_ten_key_labels_match_python(forwarder, dummy_upstream):
+    """Go ≡ Python(十键形态):last_execution_id 的存在、键序与值两侧一致。"""
+    parts = asyncio.run(build_envelope_parts(_tool_cycle_request(), MODEL, "proj-x"))
+    reference_payload, reference_rid = compose_python_envelope(parts)
+    labels = reference_payload["request"]["labels"]
+    assert "last_execution_id" in labels, "工具周期后必须携带 last_execution_id"
+    assert list(labels.keys())[:2] == ["cascade_id", "last_execution_id"]
+
+    go_env = _run_go_envelope(forwarder, dummy_upstream, parts)
+    go_labels = go_env["request"]["labels"]
+    assert list(go_labels.keys()) == list(labels.keys()), "Go/Python labels 键序不一致"
+    assert go_labels["last_execution_id"] == labels["last_execution_id"]
+
+    # 归一 requestId 后整体逐字节等价
+    expected = json.dumps(
+        reference_payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    expected = expected.replace(
+        f'"requestId":"{reference_rid}"'.encode(), b'"requestId":"<REQID>"'
+    )
+    go_env["requestId"] = "<REQID>"
+    actual_normalized = json.dumps(
+        go_env, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    assert actual_normalized == expected
 
 
 def test_go_envelope_deterministic_per_body(forwarder, dummy_upstream):

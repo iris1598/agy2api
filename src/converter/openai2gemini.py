@@ -1317,7 +1317,7 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
     def flush_pending_tool_parts():
         """将累积的 tool parts 作为单个 contents 条目追加。
 
-        role=model：实抓 2.34.0（114847/0014、112701/0011）中真实客户端的
+        role=model：实抓 2.34.0（163547 真实转发会话 0020 等）中真实客户端的
         functionResponse 消息是 role=model，不是 Gemini 公开 API 惯例的 user。
         """
         nonlocal pending_tool_parts
@@ -1457,12 +1457,20 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
     flush_pending_tool_parts()
     _sanitize_openai_roundtrip_signatures(contents)
 
-    # 强化修复: 合并相邻相同 role 的 contents (Gemini 强制要求交替角色，避免多轮 tool 后紧跟 user 导致 0-token 空回)
+    # 合并相邻 user 轮的 contents(历史兼容:tool 结果曾以 user role 发送,
+    # [model(fc), user(fr), user(msg)] 相邻 user 会触发上游 0-token 空回)。
+    # model 轮不再合并:实抓 163547(真实转发会话)证明真实客户端的
+    # model(functionCall) 与 model(functionResponse) 是相邻的独立 content,
+    # 上游完全接受;合并会破坏 fc/fr 轮布局与 step 计数口径。
     merged_contents = []
     for c in contents:
         if not c.get("parts"):
             continue
-        if merged_contents and merged_contents[-1]["role"] == c["role"]:
+        if (
+            merged_contents
+            and merged_contents[-1]["role"] == "user"
+            and c["role"] == "user"
+        ):
             merged_contents[-1]["parts"].extend(c["parts"])
         else:
             merged_contents.append(c)
