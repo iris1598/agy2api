@@ -32,6 +32,10 @@ ENV_MAPPINGS = {
     "OAUTH_PROXY_URL": "oauth_proxy_url",
     "GOOGLEAPIS_PROXY_URL": "googleapis_proxy_url",
     "ANTIGRAVITY_API_URL": "antigravity_api_url",
+    "UPSTREAM_TLS_IMPERSONATION": "upstream_tls_impersonation",
+    "STRICT_FIDELITY": "strict_fidelity",
+    "CREDENTIAL_MAX_CONCURRENT": "credential_max_concurrent",
+    "UPSTREAM_TLS_PROXY_URL": "upstream_tls_proxy_url",
     "AUTO_BAN": "auto_ban_enabled",
     "AUTO_BAN_ERROR_CODES": "auto_ban_error_codes",
     "RETRY_429_MAX_RETRIES": "retry_429_max_retries",
@@ -160,6 +164,72 @@ async def get_proxy_config():
     optional embedded credentials (user:pass@host:port).
     """
     return validate_proxy_url(await get_config_value("proxy", env_var="PROXY"))
+
+
+async def get_upstream_tls_impersonation_enabled() -> bool:
+    """Go 出站 TLS 转发器开关（默认开启）。
+
+    开启且二进制可用时，发往 Antigravity API 的请求经本机 Go 转发器出站，
+    以获得与真实客户端一致的 ClientHello；关闭或二进制缺失时回退 httpx。
+
+    Environment variable: UPSTREAM_TLS_IMPERSONATION
+    Database config key: upstream_tls_impersonation
+    Default: True
+    """
+    env_value = os.getenv("UPSTREAM_TLS_IMPERSONATION")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+    return bool(await get_config_value("upstream_tls_impersonation", True))
+
+
+async def get_credential_max_concurrent() -> int:
+    """单个凭证允许的在途请求数上限（默认 2，0 表示不限制）。
+
+    真实用户不会同时对同一账号发起大量 agent 流；超限应在本地排队，
+    而不是换号硬冲。
+
+    Environment variable: CREDENTIAL_MAX_CONCURRENT
+    Database config key: credential_max_concurrent
+    """
+    env_value = os.getenv("CREDENTIAL_MAX_CONCURRENT")
+    if env_value:
+        try:
+            return int(env_value)
+        except ValueError:
+            return 2
+    return int(await get_config_value("credential_max_concurrent", 2))
+
+
+async def get_strict_fidelity_enabled() -> bool:
+    """保真度严格模式（默认开启）。
+
+    开启时：模型枚举缺失、客户端携带真实客户端不会发的字段、参数与模型档位
+    冲突等情况直接返回错误，不发送上游请求，也不做静默降级。
+
+    Environment variable: STRICT_FIDELITY
+    Database config key: strict_fidelity
+    Default: True
+    """
+    env_value = os.getenv("STRICT_FIDELITY")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+    return bool(await get_config_value("strict_fidelity", True))
+
+
+async def get_upstream_tls_proxy_url() -> str:
+    """Python 访问 Go 转发器的本地地址。
+
+    Environment variable: UPSTREAM_TLS_PROXY_URL
+    Database config key: upstream_tls_proxy_url
+    Default: http://127.0.0.1:17890
+    """
+    return str(
+        await get_config_value(
+            "upstream_tls_proxy_url",
+            "http://127.0.0.1:17890",
+            "UPSTREAM_TLS_PROXY_URL",
+        )
+    )
 
 
 async def get_auto_ban_enabled() -> bool:

@@ -1,3 +1,10 @@
+# ---- Go 出站 TLS 转发器（与真实客户端同栈，ClientHello/JA3 逐段一致）----
+# 需要 Go >= 1.26（SecP256r1MLKEM768 / SecP384r1MLKEM1024 曲线常量）。
+FROM golang:1.27-alpine AS gobuild
+WORKDIR /src
+COPY tools/upstream_tls_proxy/ ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/upstream-proxy .
+
 # Multi-stage build for agy2api
 FROM python:3.13-slim as base
 
@@ -33,6 +40,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
+
+# Go 出站 TLS 转发器（Python 侧找不到二进制时自动回退 httpx）
+COPY --from=gobuild /out/upstream-proxy /app/tools/upstream_tls_proxy/bin/upstream-proxy
 
 # Expose port
 EXPOSE 7861

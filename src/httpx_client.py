@@ -15,13 +15,22 @@ import asyncio
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import httpx
 import json
 from fastapi import Response
 
-from config import get_proxy_config, get_stream_read_timeout
+from config import (
+    get_antigravity_api_url,
+    get_proxy_config,
+    get_stream_read_timeout,
+    get_upstream_tls_impersonation_enabled,
+    get_upstream_tls_proxy_url,
+)
 from log import log
+from src import upstream_proxy
+from src.fidelity import FidelityError
 
 # ====================== 共享客户端 ======================
 
@@ -88,7 +97,7 @@ def _evict_lru_locked() -> List[httpx.AsyncClient]:
     while len(_clients) > _MAX_CACHED_CLIENTS:
         victim_key = None
         for key in _clients:
-            if key == _global_proxy_key:
+            if key == _global_proxy_key or key == _SIDECAR_KEY:
                 continue
             victim_key = key
             break
@@ -152,6 +161,71 @@ async def _get_shared_client(proxy: Optional[str] = None) -> httpx.AsyncClient:
             _schedule_close(stale)
 
         return new_client
+
+
+# ====================== Go 出站 TLS 转发器 ======================
+
+_SIDECAR_KEY = "s:"
+
+
+def _build_sidecar_request(
+    url: str, sidecar_base: str, proxy: Optional[str]
+) -> Tuple[str, Dict[str, str]]:
+    """把原始上游 URL 改写成发往本机 Go 转发器的 URL + 透传头（纯函数）。"""
+    target = urlsplit(url)
+    base = urlsplit(sidecar_base)
+    path = target.path or "/"
+    new_url = f"{base.scheme}://{base.netloc}{path}"
+    if target.query:
+        new_url += "?" + target.query
+    extra = {"X-Upstream-URL": url}
+    if proxy:
+        extra["X-Upstream-Proxy"] = proxy
+    return new_url, extra
+
+
+async def _get_sidecar_client() -> httpx.AsyncClient:
+    """访问本机转发器的客户端（禁用环境变量代理，避免把回环请求绕出去）。"""
+    client = _clients.get(_SIDECAR_KEY)
+    if client is not None:
+        _clients.move_to_end(_SIDECAR_KEY)
+        return client
+
+    async with _clients_lock:
+        client = _clients.get(_SIDECAR_KEY)
+        if client is not None:
+            _clients.move_to_end(_SIDECAR_KEY)
+            return client
+        new_client = httpx.AsyncClient(timeout=None, trust_env=False)
+        _clients[_SIDECAR_KEY] = new_client
+        _clients.move_to_end(_SIDECAR_KEY)
+        stale = _evict_lru_locked()
+        if stale:
+            _schedule_close(stale)
+        return new_client
+
+
+async def _impersonation_request(
+    url: str, proxy: Optional[str]
+) -> Optional[Tuple[str, Dict[str, str]]]:
+    """若启用 Go 转发器且目标是 Antigravity API，返回改写后的请求参数。"""
+    if not await get_upstream_tls_impersonation_enabled():
+        return None
+    target = urlsplit(url)
+    if target.scheme != "https":
+        return None
+    api_host = urlsplit(await get_antigravity_api_url()).hostname
+    if not api_host or target.hostname != api_host:
+        return None
+
+    sidecar = await get_upstream_tls_proxy_url()
+    if not await asyncio.to_thread(upstream_proxy.ensure_running, sidecar):
+        # 严格模式：没有可用的 Go 出站核心就直接失败，不回退 httpx。
+        raise FidelityError(
+            "tls_sidecar_unavailable",
+            "Go 转发器未就绪（未编译/启动失败/端口不可用）",
+        )
+    return _build_sidecar_request(url, sidecar, proxy)
 
 
 async def close_shared_clients() -> None:
@@ -236,6 +310,21 @@ async def post_async(
     **kwargs,
 ) -> httpx.Response:
     """通用异步POST请求"""
+    impersonated = await _impersonation_request(url, proxy)
+    if impersonated is not None:
+        new_url, extra = impersonated
+        merged = {**(headers or {}), **extra}
+        sidecar = await _get_sidecar_client()
+        try:
+            return await sidecar.post(
+                new_url, data=data, json=json, headers=merged, timeout=timeout, **kwargs
+            )
+        except httpx.HTTPError as exc:
+            # 严格模式：不做直连回退（换出口/换 TLS 栈都会破坏一致性）。
+            raise FidelityError(
+                "tls_sidecar_unavailable", f"转发器请求失败: {type(exc).__name__}: {exc}"
+            ) from exc
+
     client = await _get_shared_client(proxy)
     return await client.post(
         url, data=data, json=json, headers=headers, timeout=timeout, **kwargs
@@ -262,27 +351,51 @@ async def stream_post_async(
         )
         return
 
-    client = await _get_shared_client(proxy)
-
     # 流式请求默认启用分阶段超时（防上游挂起导致回合锁/并发名额永久占用）；
     # 调用方显式传入 timeout 时以调用方为准。
     if "timeout" not in kwargs:
         kwargs["timeout"] = await _get_stream_timeout()
 
+    # 优先经 Go 转发器出站（指纹对齐）；转发器不可用时抛 FidelityError，
+    # 不做 httpx 回退（宁可报错，不静默降级）。
+    impersonated = await _impersonation_request(url, proxy)
+    if impersonated is not None:
+        new_url, extra = impersonated
+        merged = {**(headers or {}), **extra}
+        sidecar = await _get_sidecar_client()
+        stream_ctx = sidecar.stream("POST", new_url, json=body, headers=merged, **kwargs)
+        try:
+            r = await stream_ctx.__aenter__()
+        except httpx.HTTPError as exc:
+            raise FidelityError(
+                "tls_sidecar_unavailable",
+                f"转发器流式连接失败: {type(exc).__name__}: {exc}",
+            ) from exc
+        try:
+            async for item in _iter_stream(r, native):
+                yield item
+        finally:
+            await stream_ctx.__aexit__(None, None, None)
+        return
+
+    client = await _get_shared_client(proxy)
     async with client.stream(
         "POST", url, json=body, headers=headers, **kwargs
     ) as r:
-        # 错误直接返回
-        if r.status_code != 200:
-            yield Response(await r.aread(), r.status_code, dict(r.headers))
-            return
+        async for item in _iter_stream(r, native):
+            yield item
 
-        # 如果native=True，直接返回bytes流
-        if native:
-            async for chunk in r.aiter_bytes():
-                yield chunk
-        else:
-            # 通过aiter_lines转化成str流返回
-            async for line in r.aiter_lines():
-                yield line
+
+async def _iter_stream(r: httpx.Response, native: bool) -> AsyncGenerator[Any, None]:
+    """把一个上游流响应转换成 antigravity 层期望的产出（错误 Response / bytes / 文本行）。"""
+    if r.status_code != 200:
+        yield Response(await r.aread(), r.status_code, dict(r.headers))
+        return
+
+    if native:
+        async for chunk in r.aiter_bytes():
+            yield chunk
+    else:
+        async for line in r.aiter_lines():
+            yield line
 

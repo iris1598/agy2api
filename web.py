@@ -46,6 +46,36 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.error(f"数据库初始化失败: {e}")
 
+    # 出站 TLS 核心自检：严格模式下不可用就拒绝启动（不回退、不带病运行）
+    try:
+        import asyncio as asyncio_module
+
+        from config import (
+            get_strict_fidelity_enabled,
+            get_upstream_tls_impersonation_enabled,
+            get_upstream_tls_proxy_url,
+        )
+        from src import upstream_proxy
+
+        if await get_upstream_tls_impersonation_enabled():
+            sidecar_url = await get_upstream_tls_proxy_url()
+            ready = await asyncio_module.to_thread(
+                upstream_proxy.ensure_running, sidecar_url
+            )
+            if ready:
+                log.info(f"出站 TLS 核心就绪: {sidecar_url}")
+            elif await get_strict_fidelity_enabled():
+                raise RuntimeError(
+                    "Go 出站 TLS 转发器不可用（严格模式 STRICT_FIDELITY 拒绝启动）；"
+                    "请先编译 tools/upstream_tls_proxy"
+                )
+            else:
+                log.warning("出站 TLS 核心不可用，将回退 httpx（非严格模式）")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        log.error(f"出站 TLS 自检异常: {e}")
+
     # 初始化会话凭证缓存（Redis 可选，未配置时使用内存后端）
     try:
         import os as os_module
@@ -95,6 +125,13 @@ async def lifespan(app: FastAPI):
         await session_cache.close()
     except Exception as e:
         log.debug(f"关闭会话缓存时出错: {e}")
+
+    # 停止 Go 出站 TLS 转发器（若由本进程拉起）
+    try:
+        from src import upstream_proxy
+        upstream_proxy.stop()
+    except Exception as e:
+        log.debug(f"关闭 Go 转发器时出错: {e}")
 
     log.info("AGY2API 主服务已停止")
 
