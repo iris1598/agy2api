@@ -91,6 +91,16 @@ async def lifespan(app: FastAPI):
 
     # OAuth回调服务器将在需要时按需启动
 
+    # 每凭证额度预算后台刷新（防封：接近阈值提前剔除候选，不等 429）
+    try:
+        from config import get_quota_budget_enabled
+        from src import quota_budget
+
+        if await get_quota_budget_enabled():
+            quota_budget.start()
+    except Exception as e:
+        log.warning(f"额度预算任务启动失败（不影响请求）: {e}")
+
     yield
 
     # 清理资源
@@ -132,6 +142,14 @@ async def lifespan(app: FastAPI):
         upstream_proxy.stop()
     except Exception as e:
         log.debug(f"关闭 Go 转发器时出错: {e}")
+
+    # 停止额度预算后台刷新任务
+    try:
+        from src import quota_budget
+        await quota_budget.stop()
+        log.info("额度预算后台任务已停止")
+    except Exception as e:
+        log.debug(f"关闭额度预算任务时出错: {e}")
 
     log.info("AGY2API 主服务已停止")
 

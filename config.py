@@ -36,6 +36,13 @@ ENV_MAPPINGS = {
     "STRICT_FIDELITY": "strict_fidelity",
     "CREDENTIAL_MAX_CONCURRENT": "credential_max_concurrent",
     "UPSTREAM_TLS_PROXY_URL": "upstream_tls_proxy_url",
+    "QUOTA_BUDGET_ENABLED": "quota_budget_enabled",
+    "QUOTA_BUDGET_THRESHOLD": "quota_budget_threshold",
+    "QUOTA_BUDGET_REFRESH_MINUTES": "quota_budget_refresh_minutes",
+    "BACKOFF_ENABLED": "backoff_enabled",
+    "BACKOFF_MAX_DELAY": "backoff_max_delay",
+    "MODEL_MIX_ENABLED": "model_mix_enabled",
+    "MODEL_MIX_DAILY_LIMIT": "model_mix_daily_limit",
     "AUTO_BAN": "auto_ban_enabled",
     "AUTO_BAN_ERROR_CODES": "auto_ban_error_codes",
     "RETRY_429_MAX_RETRIES": "retry_429_max_retries",
@@ -230,6 +237,119 @@ async def get_upstream_tls_proxy_url() -> str:
             "UPSTREAM_TLS_PROXY_URL",
         )
     )
+
+
+async def get_quota_budget_enabled() -> bool:
+    """每凭证额度预算开关（默认开启）。
+
+    开启时后台定期调用 retrieveUserQuotaSummary 刷新各凭证剩余额度，
+    低于阈值的账号在凭证选取时直接剔除，不等 429。
+    刷新失败或数据过期时按未耗尽处理（fail-open），不影响可用性。
+
+    Environment variable: QUOTA_BUDGET_ENABLED
+    Database config key: quota_budget_enabled
+    Default: True
+    """
+    env_value = os.getenv("QUOTA_BUDGET_ENABLED")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+    return bool(await get_config_value("quota_budget_enabled", True))
+
+
+async def get_quota_budget_threshold() -> float:
+    """额度预算阈值：任一配额桶 remainingFraction 低于该值视为额度耗尽。
+
+    Environment variable: QUOTA_BUDGET_THRESHOLD
+    Database config key: quota_budget_threshold
+    Default: 0.1
+    """
+    env_value = os.getenv("QUOTA_BUDGET_THRESHOLD")
+    if env_value:
+        try:
+            return max(0.0, float(env_value))
+        except ValueError:
+            pass
+    return float(await get_config_value("quota_budget_threshold", 0.1))
+
+
+async def get_quota_budget_refresh_minutes() -> float:
+    """额度预算后台刷新间隔（分钟）。
+
+    Environment variable: QUOTA_BUDGET_REFRESH_MINUTES
+    Database config key: quota_budget_refresh_minutes
+    Default: 30
+    """
+    env_value = os.getenv("QUOTA_BUDGET_REFRESH_MINUTES")
+    if env_value:
+        try:
+            return max(1.0, float(env_value))
+        except ValueError:
+            pass
+    return float(await get_config_value("quota_budget_refresh_minutes", 30))
+
+
+async def get_backoff_enabled() -> bool:
+    """重试指数退避开关（默认开启）。
+
+    关闭时退回固定 retry_interval 等待。开启时按账号连续失败次数做
+    2^n 指数退避 + 随机抖动，上限 backoff_max_delay。
+
+    Environment variable: BACKOFF_ENABLED
+    Database config key: backoff_enabled
+    Default: True
+    """
+    env_value = os.getenv("BACKOFF_ENABLED")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+    return bool(await get_config_value("backoff_enabled", True))
+
+
+async def get_backoff_max_delay() -> float:
+    """指数退避的单次等待上限（秒）。
+
+    Environment variable: BACKOFF_MAX_DELAY
+    Database config key: backoff_max_delay
+    Default: 60
+    """
+    env_value = os.getenv("BACKOFF_MAX_DELAY")
+    if env_value:
+        try:
+            return max(1.0, float(env_value))
+        except ValueError:
+            pass
+    return float(await get_config_value("backoff_max_delay", 60))
+
+
+async def get_model_mix_enabled() -> bool:
+    """模型分布约束开关（默认关闭）。
+
+    开启时按账号统计每日高价模型（Claude / Gemini 高档）请求数，
+    达到 model_mix_daily_limit 后该账号当天不再承接高价模型请求。
+
+    Environment variable: MODEL_MIX_ENABLED
+    Database config key: model_mix_enabled
+    Default: False
+    """
+    env_value = os.getenv("MODEL_MIX_ENABLED")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+    return bool(await get_config_value("model_mix_enabled", False))
+
+
+async def get_model_mix_daily_limit() -> int:
+    """单账号每日高价模型请求数上限（0 表示不限制）。
+
+    Environment variable: MODEL_MIX_DAILY_LIMIT
+    Database config key: model_mix_daily_limit
+    Default: 50
+    """
+    env_value = os.getenv("MODEL_MIX_DAILY_LIMIT")
+    if env_value:
+        try:
+            return max(0, int(env_value))
+        except ValueError:
+            pass
+    return int(await get_config_value("model_mix_daily_limit", 50))
 
 
 async def get_auto_ban_enabled() -> bool:

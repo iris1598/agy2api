@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional, Set, Tuple
 from log import log
 
 from config import get_credential_select_mode
-from src import session_cache
+from src import model_mix, quota_budget, session_cache
 from src.google_oauth_api import Credentials
 from src.storage.database import get_database
 
@@ -50,6 +50,10 @@ async def get_valid_credential(
     database = await get_database()
     mode = await get_credential_select_mode()
     tried_emails: Set[str] = set(exclude_emails) if exclude_emails else set()
+
+    # 防封前置过滤：额度已耗尽 / 高价模型当日超限的账号直接排除（不参与换号重试）
+    tried_emails |= await quota_budget.exhausted_emails()
+    tried_emails |= await model_mix.over_limit_emails(model_name)
 
     # cache 模式：先查会话绑定
     if mode == "cache" and session_key:

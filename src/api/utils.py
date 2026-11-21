@@ -4,6 +4,7 @@ API 客户端共用基础功能：自动封禁、错误重试、调用结果记�
 
 import asyncio
 import json
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -12,12 +13,44 @@ from typing import Any, Dict, Optional
 from config import (
     get_auto_ban_enabled,
     get_auto_ban_error_codes,
+    get_backoff_enabled,
+    get_backoff_max_delay,
     get_retry_429_enabled,
     get_retry_429_interval,
     get_retry_429_max_retries,
 )
 from log import log
 from src.credential_manager import record_api_call_result, set_cred_disabled
+
+
+# 按账号累计的连续失败次数（指数退避用；成功即清零，进程内状态）
+_consecutive_failures: Dict[str, int] = {}
+
+
+def _note_retry_failure(email: str) -> int:
+    count = _consecutive_failures.get(email, 0) + 1
+    if email:
+        _consecutive_failures[email] = count
+    return count
+
+
+def note_retry_success(email: str) -> None:
+    """凭证成功出站后清零连续失败计数（指数退避复位）。"""
+    if email:
+        _consecutive_failures.pop(email, None)
+
+
+async def _backoff_delay(retry_interval: float, failures: int) -> float:
+    """指数退避 + 随机抖动；关闭开关或未累计失败时退回固定间隔。
+
+    上游给出明确冷却时间时，冷却由模型级冷却 + 换号逻辑处理，
+    这里的延迟只决定"下一次尝试前等多久"。
+    """
+    if not await get_backoff_enabled() or failures <= 1:
+        return retry_interval
+    delay = retry_interval * (2 ** min(failures - 1, 10))
+    delay = min(delay, await get_backoff_max_delay())
+    return delay + random.uniform(0, min(1.0, retry_interval))
 
 
 # ==================== 错误检查与处理 ====================
@@ -54,9 +87,15 @@ async def handle_error_with_retry(
     3. 500错误(服务临时不可用)
     4. 导致凭证封禁的错误(AUTO_BAN_ERROR_CODES配置)
 
+    等待策略：按账号连续失败次数做指数退避 + 抖动（BACKOFF_ENABLED），
+    关闭时退回固定 retry_interval。
+
     Returns:
         bool: True表示需要继续重试，False表示不需要重试
     """
+    failures = _note_retry_failure(email)
+    delay = await _backoff_delay(retry_interval, failures)
+
     # 优先检查自动封禁
     if await check_should_auto_ban(status_code):
         await handle_auto_ban(status_code, email)
@@ -65,9 +104,10 @@ async def handle_error_with_retry(
         if retry_enabled and attempt < max_retries:
             log.info(
                 f"[RETRY] Retrying with next credential after auto-ban "
-                f"(status {status_code}, attempt {attempt + 1}/{max_retries})"
+                f"(status {status_code}, attempt {attempt + 1}/{max_retries}, "
+                f"backoff {delay:.1f}s)"
             )
-            await asyncio.sleep(retry_interval)
+            await asyncio.sleep(delay)
             return True
         return False
 
@@ -75,9 +115,10 @@ async def handle_error_with_retry(
     if status_code in (429, 500, 503) and retry_enabled and attempt < max_retries:
         log.info(
             f"[RETRY] {status_code} error encountered, retrying "
-            f"(attempt {attempt + 1}/{max_retries})"
+            f"(attempt {attempt + 1}/{max_retries}, {failures} consecutive failures, "
+            f"backoff {delay:.1f}s)"
         )
-        await asyncio.sleep(retry_interval)
+        await asyncio.sleep(delay)
         return True
 
     return False
@@ -102,6 +143,7 @@ async def record_api_call_success(
 ) -> None:
     """记录API调用成功"""
     if email:
+        note_retry_success(email)
         await record_api_call_result(
             email, True, model_name=model_name
         )
