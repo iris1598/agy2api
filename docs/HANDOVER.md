@@ -703,3 +703,49 @@ labels/step/header/TLS，从未校验 user 文本形态），发现并修复了�
 保持 sys 敏感 / wrap 层 sys 演化下 trajectory+step+盖戳全连续）；更新 2 个
 固化旧行为的断言（request_seq 连续计数、首轮即恒定 docstring）。
 **pytest 241 passed**；`verify --envelope --json` 全绿。
+
+### 10.15 第十轮：旗标体系与流量形态逆向（2026-11-21，owner 指示"继续，不跑真实请求"）
+
+全部基于既有实抓响应 + 客户端二进制静态解析，零新流量：
+
+1. **listExperiments 实抓响应全量解析**（163547/0005）：105 个 experimentIds +
+   **635 个旗标**。4 个模板门控旗标当时值：`generic-system-prompt=True`、
+   `jetski-generative-ui=True`、`enable-url-artifacts=False`、
+   `jetski-generative-ui-prompt=False`。**会话内 listExperiments 只拉取一次**
+   （0005 之后无再取）→ §10.9.6 的 0013↔0080 sys 段落差异**不是旗标翻转**，
+   而是模板渲染上下文随会话状态变化（IsAutonomous / artifacts 段落按需出现）。
+   sys 演化机制就此完全闭环。
+2. **真实流量形态量化**（`tools/_rev/monitor_timeline.py` 可复跑）：163547
+   全时间线——checkpoint **每会话 1 次**且先于首条 agent 请求（0012）；
+   **agent_monitoring 以约 2 条 agent : 1 条 monitoring 的频率穿插**
+   （30 agent vs 25 monitoring ≈ 0.83），新 user 轮开启后连发 2 条
+   （0075+0076）；相邻请求间隔 5~15s。**代理（只发 agent）与真实客户端
+   的流量形态差异从此有精确数字**。owner 已决策代理不发这两类请求
+   （§10.9.5），此处仅存档供再评估。
+3. **模型角色体系**（实抓 live flags）：`orchestrator-model-roles` =
+   orchestrators `[gemini-4-neon, gemini-4-carbon, gemini-4-argon,
+   claude-opus-5-5]` / executors `[gemini-4-hydrogen, claude-sonnet-5-5]`；
+   `checkpoint-variant = claude-1m_840k`；`browser-subagent-model =
+   gemini-3.8-flash-low`；`ambient_disabled_models = fable-5.2-*,claude-fable-5-2*`
+   （fable 系列首次现形）。Google 内部模型家族命名/角色分工就此有实抓依据。
+4. **客户端内置默认旗标资产**（`tools/_rev/extract_flags_asset.py` 按模式
+   定位提取，93KB JSON → 本地 `client_default_flags.json`）：六段
+   `base / subclients / os / model_profiles / models / enterprise`。
+   - `models` 段 = **别名→规范族映射**（66 项→13 规范族）：M525~M531
+     （hydrogen 系含 M526）→ `MODEL_PLACEHOLDER_M432`；M50 →
+     `MODEL_GOOGLE_GEMINI_2_5_FLASH`。labels.model_enum 上报的是**别名原值**
+     （实抓 M526 未规范化），映射仅客户端内部用。
+   - `model_profiles` = 按规范族客户端配置：`CASCADE_USE_EXPERIMENT_CHECKPOINTER`
+     （checkpoint 策略/阈值/重试）、**`allow-experimental-monitors=True`**
+     （agent_monitoring 的开关所在）、`task-details-suffix`、
+     `template__system_prompts__guidelines`（按模型 sys 指南模板）。
+   - 该资产是**默认值快照**（listExperiments 失败时的兜底），live 值以
+     实抓响应为准。
+5. **Mendel 架构闭环**（asar `mendelFlagSync.js`）：LS 是旗标缓存层（上游
+   listExperiments），Electron 每 60s 轮询 LS 本地
+   `POST /exa.language_server_pb.LanguageServerService/GetMendelFlags`
+   （Connect 协议，`x-codeium-csrf-token` 鉴权）；本地管理面还有
+   `/auth/mint`（UI bootstrap 单次令牌）。代理无交互，仅补全架构图。
+6. **凭证存储无缺口**：代理自建 OAuth 回调流（`src/auth.py`），
+   client_id/secret 与二进制逐字节一致（§10.13 补记），无需解析客户端
+   本地令牌存储。
