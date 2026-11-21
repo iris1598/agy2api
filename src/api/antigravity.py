@@ -11,6 +11,7 @@ import time
 import traceback
 import uuid
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncGenerator, Dict, List, NamedTuple, Optional, Callable, Set, Tuple
 
@@ -21,6 +22,7 @@ from config import (
     get_request_log_enabled,
     get_request_log_error_codes,
     get_strict_fidelity_enabled,
+    get_upstream_tls_impersonation_enabled,
     get_usage_log_enabled,
 )
 from log import log
@@ -261,17 +263,55 @@ def _sanitize_antigravity_headers(extra_headers: Optional[Dict[str, str]]) -> Di
     return sanitized
 
 
-async def wrap_cli_request(
+@dataclass
+class EnvelopeParts:
+    """信封的结构化输入:在 Python 侧算好的全部锚点与内层有序值片。
+
+    职责切分(报文双帧、字节唯一作者):
+    - 值单一来源在这里——锚点/labels 值、requestType、内层键序与值全部确定;
+    - 字节唯一作者是 Go(tools/upstream_tls_proxy/envelope.go):接收
+      compose_sidecar_body 的 wrapper(内层值片为原始 JSON 字节),构造
+      内层帧/labels/requestId/外层六键;Python 直连路径由
+      compose_python_envelope 产出参照实现,两者必须逐字节等价
+      (tests/test_go_envelope_bytes.py 硬校验)。
+    """
+
+    inner_entries: List[Tuple[str, Any]]  # 有序 (key, value);labels 位为 (key, None) 占位
+    labels: Dict[str, str]                # 九键 labels 值(_build_labels 产物,Python 作曲用)
+    anchors: Dict[str, Any]               # Go envelopeAnchors 所需的 camelCase 值
+    model: str
+    request_type: str
+    project_id: str
+    trajectory_id: str
+    cascade_id: str
+    step: int
+
+
+# Go 转发器信封模式判别头(转发器侧会剥离,不会发往上游)
+UPSTREAM_BUILD_ENVELOPE_HEADER = "X-Upstream-Build-Envelope"
+
+# 内层值片里 labels 的占位:labels 对象字节由 Go 产出(报文唯一作者),
+# Python 只在值片序列里标位
+_LABELS_PLACEHOLDER_KEY = "labels"
+
+# 与 httpx json= 完全相同的序列化参数(httpx._content._encode_json):
+# 保证值片字节与 Python 直连路径逐字节一致
+_INNER_JSON_DUMPS_KWARGS = {"ensure_ascii": False, "separators": (",", ":"), "allow_nan": False}
+
+
+def _serialize_inner_value(value: Any) -> str:
+    """内层值片序列化(参数与 httpx json= 一致)。"""
+    return json.dumps(value, **_INNER_JSON_DUMPS_KWARGS)
+
+
+async def build_envelope_parts(
     gemini_request: Dict[str, Any],
     model: str,
     project_id: str,
     account_salt: str = "",
-) -> Tuple[Dict[str, Any], str]:
+) -> EnvelopeParts:
     """
-    将 Gemini 格式请求包装成 Antigravity CLI 格式（对齐官方 v1internal 信封）。
-    返回 (payload, request_id)。
-
-    顶层信封严格遵循官方键序: project -> requestId -> request -> model -> userAgent -> requestType。
+    构造信封的结构化输入(不做任何序列化与信封拼装)。
 
     严格模式（默认开启）下，入站请求先经 src/fidelity.py 校验：字段白名单、
     模型枚举存在性、thinkingConfig 与模型档位一致；不满足直接抛 FidelityError。
@@ -311,25 +351,39 @@ async def wrap_cli_request(
         )
     step = 1 + 2 * model_turns
 
-    # requestId：官方 5 段形态 agent/{cascadeId}/{unixMs}/{trajectoryId}/{step}
     # cascadeId / trajectoryId 与 sessionId 同源确定性派生（无锚点时各自随机兜底），
-    # 第 2 段与 labels.cascade_id 严格一致
+    # 兜底在这里生成——两种作曲模式（Go / Python）拿到完全相同的锚点
     trajectory_id = derived_ids.trajectory_id or str(uuid.uuid4())
     cascade_id = derived_ids.cascade_id or str(uuid.uuid4())
-    request_id = _generate_request_id(cascade_id, step, trajectory_id)
 
     # thoughtSignature 回注：真实客户端会把上一轮签名带回；兼容客户端常丢弃。
     # 只补回本轨迹确实见过的签名，不伪造。
     thought_signature_cache.replay_into_contents(inner.get("contents"), trajectory_id)
 
-    # 注入 labels（键序/键集完全对齐实抓样本；last_step_index = step - 1）
-    inner["labels"] = _build_labels(
+    # labels 值（键序/键集完全对齐实抓样本；last_step_index = step - 1）。
+    # 值单一来源在这里算好;字节由作曲方(Go / Python)产出
+    labels = _build_labels(
         model,
         trajectory_id,
         step,
         cascade_id=cascade_id,
         request_seq=_next_trajectory_request_seq(trajectory_id),
     )
+    # labels 注入内层(位置由拓扑对齐决定:toolConfig 之后、generationConfig 之前);
+    # 值片序列里会替换为占位,字节由作曲方产出
+    inner["labels"] = labels
+    anchors = {
+        "cascadeId": labels["cascade_id"],
+        "rootCascadeId": labels["root_cascade_id"],
+        "trajectoryId": labels["trajectory_id"],
+        "step": step,
+        "lastStepIndex": labels["last_step_index"],
+        "modelEnum": labels["model_enum"],
+        "requestIdLabel": labels["request_id"],
+        "usedClaude": labels["used_claude"],
+        "usedClaudeConservative": labels["used_claude_conservative"],
+        "usedNonGeminiModel": labels["used_non_gemini_model"],
+    }
 
     # requestType 与 toolConfig 对齐官方 agent 状态机：
     # - 常规智能体交互（有 tools 或含工具调用上下文）→ agent；
@@ -360,15 +414,112 @@ async def wrap_cli_request(
     # contents -> systemInstruction -> tools -> toolConfig -> labels -> generationConfig -> sessionId -> 其余
     inner = _align_inner_request_topology(inner)
 
+    # 有序值片:labels 位放 None 占位(字节由 Go 在原位产出)
+    inner_entries: List[Tuple[str, Any]] = [
+        (_LABELS_PLACEHOLDER_KEY, None) if key == _LABELS_PLACEHOLDER_KEY else (key, value)
+        for key, value in inner.items()
+    ]
+
+    return EnvelopeParts(
+        inner_entries=inner_entries,
+        labels=labels,
+        anchors=anchors,
+        model=model,
+        request_type="image_gen" if is_image_request else ("agent" if is_agent_request else "chat"),
+        project_id=project_id,
+        trajectory_id=trajectory_id,
+        cascade_id=cascade_id,
+        step=step,
+    )
+
+
+def compose_python_envelope(parts: EnvelopeParts) -> Tuple[Dict[str, Any], str]:
+    """Python 参照作曲:六键信封 dict(顶层键序 project -> requestId ->
+    request -> model -> userAgent -> requestType)。直连 httpx 路径与
+    测试/verify 使用;字节由 httpx json= 序列化。"""
+    request_id = _generate_request_id(parts.cascade_id, parts.step, parts.trajectory_id)
+    inner: Dict[str, Any] = {}
+    for key, value in parts.inner_entries:
+        inner[key] = parts.labels if key == _LABELS_PLACEHOLDER_KEY else value
     payload = {
-        "project": project_id,
+        "project": parts.project_id,
         "requestId": request_id,
         "request": inner,
-        "model": model,
+        "model": parts.model,
         "userAgent": "antigravity",
-        "requestType": "image_gen" if is_image_request else ("agent" if is_agent_request else "chat"),
+        "requestType": parts.request_type,
     }
     return payload, request_id
+
+
+def compose_sidecar_body(parts: EnvelopeParts) -> Dict[str, Any]:
+    """Go 模式作曲:内层有序值片(值序列化为与 httpx 逐字节相同的 JSON 文本)
+    + 锚点,交给 tools/upstream_tls_proxy/envelope.go 构造最终报文。
+    labels 位为 None 占位,由 Go 在原位替换为自己产出的 labels 对象。"""
+    return {
+        "model": parts.model,
+        "requestType": parts.request_type,
+        "project": parts.project_id,
+        "anchors": parts.anchors,
+        "innerEntries": [
+            [key, None if key == _LABELS_PLACEHOLDER_KEY else _serialize_inner_value(value)]
+            for key, value in parts.inner_entries
+        ],
+    }
+
+
+@dataclass
+class PreparedRequest:
+    """prepare_cli_request 的产物:请求体 + 附加头 + 会话锚点。"""
+
+    body: Dict[str, Any]
+    extra_headers: Dict[str, str]
+    trajectory_id: str
+    request_id: str  # Go 模式下为 ""（requestId 由转发器构造）
+
+
+async def prepare_cli_request(
+    gemini_request: Dict[str, Any],
+    model: str,
+    project_id: str,
+    account_salt: str = "",
+) -> PreparedRequest:
+    """按出站模式构造请求体:
+    - impersonation 开启（默认）:wrapper + X-Upstream-Build-Envelope 头,
+      Go 转发器是报文字节的唯一作者;
+    - 关闭:Python 参照作曲（直连 httpx 路径）。"""
+    parts = await build_envelope_parts(gemini_request, model, project_id, account_salt)
+    if await get_upstream_tls_impersonation_enabled():
+        return PreparedRequest(
+            body=compose_sidecar_body(parts),
+            extra_headers={UPSTREAM_BUILD_ENVELOPE_HEADER: "1"},
+            trajectory_id=parts.trajectory_id,
+            request_id="",
+        )
+    payload, request_id = compose_python_envelope(parts)
+    return PreparedRequest(
+        body=payload,
+        extra_headers={},
+        trajectory_id=parts.trajectory_id,
+        request_id=request_id,
+    )
+
+
+async def wrap_cli_request(
+    gemini_request: Dict[str, Any],
+    model: str,
+    project_id: str,
+    account_salt: str = "",
+) -> Tuple[Dict[str, Any], str]:
+    """
+    将 Gemini 格式请求包装成 Antigravity CLI 格式（对齐官方 v1internal 信封）。
+    返回 (payload, request_id)。
+
+    Python 参照作曲（直连 httpx 路径、测试与 sniff_cli verify 使用）；
+    经 Go 转发器出站的请求走 prepare_cli_request（报文字节唯一作者在 Go）。
+    """
+    parts = await build_envelope_parts(gemini_request, model, project_id, account_salt)
+    return compose_python_envelope(parts)
 
 
 def _align_inner_request_topology(inner: Dict[str, Any]) -> Dict[str, Any]:
@@ -667,7 +818,7 @@ async def stream_request(
     # 构建 CLI 格式请求体（严格模式下可能直接拒绝）
     inner_request = body.get("request", body)
     try:
-        final_payload, _ = await wrap_cli_request(
+        prepared = await prepare_cli_request(
             inner_request, model_name, project_id, account_salt=current_file
         )
     except FidelityError as exc:
@@ -680,7 +831,11 @@ async def stream_request(
         yield _fidelity_response(exc)
         return
 
-    trajectory_id = final_payload["request"]["labels"]["trajectory_id"]
+    # impersonation 开启时 body 是 wrapper、由 Go 构造信封;
+    # project 改写(换凭证)对两种模式统一走 body["project"]
+    final_payload = prepared.body
+    auth_headers.update(prepared.extra_headers)
+    trajectory_id = prepared.trajectory_id
 
     # 3. 调用stream_post_async进行请求
     retry_config = await get_retry_config()
@@ -1106,14 +1261,18 @@ async def non_stream_request(
     # 构建 CLI 格式请求体（严格模式下可能直接拒绝）
     inner_request = body.get("request", body)
     try:
-        final_payload, _ = await wrap_cli_request(
+        prepared = await prepare_cli_request(
             inner_request, model_name, project_id, account_salt=current_file
         )
     except FidelityError as exc:
         await _log_result(exc.status_code, False, error_message=f"{exc.reason}: {exc.detail}")
         return _fidelity_response(exc)
 
-    trajectory_id = final_payload["request"]["labels"]["trajectory_id"]
+    # impersonation 开启时 body 是 wrapper、由 Go 构造信封;
+    # project 改写(换凭证)对两种模式统一走 body["project"]
+    final_payload = prepared.body
+    auth_headers.update(prepared.extra_headers)
+    trajectory_id = prepared.trajectory_id
 
     # 3. 调用post_async进行请求
     retry_config = await get_retry_config()

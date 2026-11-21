@@ -13,6 +13,7 @@ ClientHello 与实抓逐段一致（JA3 md5 ``03117a8ed39ef02427ebbc39f121275c``
 """
 
 import asyncio
+import json
 import os
 import platform
 import socket
@@ -38,6 +39,12 @@ _BINARY_CANDIDATES = (
 
 _START_TIMEOUT = 8.0
 _MONITOR_INTERVAL = 15.0
+
+# 转发器协议版本(/__health 的 "protocol" 字段,见 envelope.go):
+# v2 = 信封模式(X-Upstream-Build-Envelope,报文唯一作者在 Go)。
+# 本进程拉起的二进制在启动后立即校验;旧二进制直接判不可用,
+# 严格模式下拒绝启动,防止静默产出错误报文。
+REQUIRED_FORWARDER_PROTOCOL = 2
 
 _lock = threading.Lock()
 _process: Optional[subprocess.Popen] = None
@@ -91,6 +98,27 @@ def find_binary() -> Optional[Path]:
         candidate = _BIN_DIR / asset
         if candidate.is_file():
             return candidate
+    return None
+
+
+def _check_protocol(host: str, port: int) -> Optional[str]:
+    """GET /__health 校验转发器协议版本;通过返回 None,否则返回原因。
+
+    只对本进程拉起的实例调用(外部手动启动的实例由操作者自管版本)。
+    """
+    try:
+        from urllib.request import urlopen
+
+        with urlopen(f"http://{host}:{port}/__health", timeout=3.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - 探活失败按不可用处理
+        return f"/__health 不可达: {type(exc).__name__}: {exc}"
+    protocol = data.get("protocol")
+    if not isinstance(protocol, int) or protocol < REQUIRED_FORWARDER_PROTOCOL:
+        return (
+            f"转发器协议版本过旧(health protocol={protocol!r},"
+            f"需要 >={REQUIRED_FORWARDER_PROTOCOL});请重新编译 tools/upstream_tls_proxy"
+        )
     return None
 
 
@@ -157,6 +185,14 @@ def ensure_running(listen_url: str) -> bool:
         if not _wait_port(host, port, _START_TIMEOUT):
             log.warning("[UPSTREAM TLS] 转发器启动后端口未就绪，严格模式下相关请求将失败")
             _terminate_locked()
+            return False
+
+        problem = _check_protocol(host, port)
+        if problem:
+            _terminate_locked()
+            if _disabled_reason is None:
+                _disabled_reason = problem
+            log.warning(f"[UPSTREAM TLS] {problem}，严格模式下相关请求将失败")
             return False
 
         log.info(f"[UPSTREAM TLS] Go 转发器已就绪: http://{host}:{port}")

@@ -36,8 +36,8 @@ from src.api.antigravity import (
     fetch_quota_info,
     build_antigravity_headers,
     fetch_credential_models,
+    prepare_cli_request,
     refresh_credential_models,
-    wrap_cli_request,
 )
 from src.httpx_client import post_async
 from src.google_oauth_api import (
@@ -937,13 +937,19 @@ async def test_credential(
         api_base_url = await get_antigravity_api_url()
         headers = build_antigravity_headers(access_token)
 
-        # 报文与真实请求同构：走 wrap_cli_request 补齐
+        # 报文与真实请求同构：走 prepare_cli_request 补齐
         # requestId / sessionId / labels / userAgent / requestType 六段信封，
-        # 不手写 payload（裸 {model, project, request} 不是任何正版客户端的形态）
+        # 不手写 payload（裸 {model, project, request} 不是任何正版客户端的形态）。
+        # impersonation 开启时 body 为 wrapper、由 Go 构造信封（与真实请求同一路径）。
+        # account_salt=email：与真实请求同口径，不同凭证的探活会话天然隔离
         gemini_request = {
             "contents": [{"role": "user", "parts": [{"text": _PROBE_TEXT}]}]
         }
-        final_payload, _ = await wrap_cli_request(gemini_request, test_model, project_id)
+        prepared = await prepare_cli_request(
+            gemini_request, test_model, project_id, account_salt=email
+        )
+        final_payload = prepared.body
+        headers.update(prepared.extra_headers)
 
         response = await post_async(
             url=f"{api_base_url}/v1internal:generateContent",

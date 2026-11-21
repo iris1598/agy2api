@@ -51,6 +51,9 @@ const (
 	headerUpstreamURL   = "X-Upstream-URL"
 	headerUpstreamProxy = "X-Upstream-Proxy"
 	headerUpstreamSNI   = "X-Upstream-SNI"
+	// 置位时请求体不是最终报文,而是"内层值片 + 锚点"的 wrapper,
+	// 由本进程构造信封(envelope.go,上游报文唯一作者)。
+	headerUpstreamBuildEnvelope = "X-Upstream-Build-Envelope"
 )
 
 // 真实客户端实测的 header 顺序（Host 与 Transfer-Encoding 由本进程生成）。
@@ -74,9 +77,10 @@ var skipHeaders = map[string]bool{
 	"te":                  true,
 	"trailer":             true,
 	"upgrade":             true,
-	"x-upstream-url":      true,
-	"x-upstream-proxy":    true,
-	"x-upstream-sni":      true,
+		"x-upstream-url":      true,
+		"x-upstream-proxy":    true,
+		"x-upstream-sni":      true,
+		"x-upstream-build-envelope": true,
 	// httpx 会自动补 Accept: */*，而实测真实客户端不发这个头 —— 这里统一丢弃。
 	"accept": true,
 }
@@ -117,8 +121,8 @@ func (f *forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(
 			w,
-			`{"status":"ok","go":%q,"alpn":["http/1.1"],"idle_connections":%d}`,
-			runtimeVersion(), idleConnectionCount(),
+			`{"status":"ok","protocol":%d,"go":%q,"alpn":["http/1.1"],"idle_connections":%d}`,
+			envelopeProtocolVersion, runtimeVersion(), idleConnectionCount(),
 		)
 		return
 	}
@@ -150,24 +154,42 @@ func (f *forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *forwarder) forward(host http.ResponseWriter, incoming *http.Request, target *url.URL, proxyRaw, sniOverride string) (int, error) {
+	hasBody := requestHasBody(incoming)
+	// 先缓冲请求体：复用连接可能已被上游关闭，需要在"写失败/读失败"时
+	// 用同一条请求在新连接上重试一次。同时限制单请求体大小，避免异常内存占用。
+	// 缓冲与信封构造都在取连接之前完成，构造失败不浪费新建的 TLS 连接。
+	var bodyBytes []byte
+	var bodyErr error
+	if hasBody {
+		bodyBytes, bodyErr = io.ReadAll(io.LimitReader(incoming.Body, maxRequestBodyBytes))
+		if bodyErr != nil {
+			http.Error(host, `{"error":"read request body failed"}`, http.StatusBadRequest)
+			return 0, bodyErr
+		}
+	}
+
+	// 信封模式:请求体是"内层值片 + 锚点"wrapper,由本进程构造最终上游报文
+	// (唯一作者,见 envelope.go)。构造必须发生在 writeAll 之前——重试路径
+	// 重发的是构造后的字节,天然幂等(同一 body 只构造一次,不会出现第二个 requestId)。
+	if incoming.Header.Get(headerUpstreamBuildEnvelope) != "" {
+		if !hasBody {
+			http.Error(host, `{"error":"envelope mode requires a body"}`, http.StatusBadRequest)
+			return 0, errors.New("envelope mode without body")
+		}
+		built, buildErr := buildEnvelope(bodyBytes)
+		if buildErr != nil {
+			log.Printf("[upstream-proxy] envelope build failed: %v", buildErr)
+			http.Error(host, `{"error":"envelope build failed"}`, http.StatusBadRequest)
+			return 0, buildErr
+		}
+		bodyBytes = built
+	}
+
 	key := poolKey(target, proxyRaw, sniOverride)
 	pooled, reused, err := acquireConn(target, proxyRaw, sniOverride)
 	if err != nil {
 		http.Error(host, `{"error":"upstream connect failed"}`, http.StatusBadGateway)
 		return 0, err
-	}
-
-	hasBody := requestHasBody(incoming)
-	// 先缓冲请求体：复用连接可能已被上游关闭，需要在"写失败/读失败"时
-	// 用同一条请求在新连接上重试一次。同时限制单请求体大小，避免异常内存占用。
-	var bodyBytes []byte
-	if hasBody {
-		bodyBytes, err = io.ReadAll(io.LimitReader(incoming.Body, maxRequestBodyBytes))
-		if err != nil {
-			pooled.conn.Close()
-			http.Error(host, `{"error":"read request body failed"}`, http.StatusBadRequest)
-			return 0, err
-		}
 	}
 
 	writeAll := func(pc *pooledConn) error {

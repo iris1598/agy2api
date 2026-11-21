@@ -2,12 +2,15 @@
 
 覆盖：
 - httpx_client 的 URL 改写（纯函数）与启用/降级判定
-- upstream_proxy 的二进制定位与"端口已在监听则复用"
+- upstream_proxy 的二进制定位、平台产物名、协议握手与"端口已在监听则复用"
 """
 
+import json
 import os
 import socket
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -200,3 +203,63 @@ class TestHealthMonitor:
         assert task is not None and not task.done()
         await upstream_proxy.stop_monitor()
         assert upstream_proxy._monitor_task is None or upstream_proxy._monitor_task.done()
+
+
+class TestProtocolCheck:
+    """/__health 协议握手:旧二进制必须被判不可用,防止静默产出错误报文。"""
+
+    @staticmethod
+    def _serve(payload: bytes):
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - http.server 约定
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        host, port = server.server_address
+        return server, host, port
+
+    def test_protocol_ok(self):
+        payload = json.dumps({"status": "ok", "protocol": upstream_proxy.REQUIRED_FORWARDER_PROTOCOL}).encode()
+        server, host, port = self._serve(payload)
+        try:
+            assert upstream_proxy._check_protocol(host, server.server_address[1]) is None
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_protocol_too_old_rejected(self):
+        payload = json.dumps({"status": "ok", "protocol": upstream_proxy.REQUIRED_FORWARDER_PROTOCOL - 1}).encode()
+        server, host, port = self._serve(payload)
+        try:
+            problem = upstream_proxy._check_protocol(host, server.server_address[1])
+            assert problem is not None and "协议版本过旧" in problem
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_protocol_missing_rejected(self):
+        payload = json.dumps({"status": "ok"}).encode()
+        server, host, port = self._serve(payload)
+        try:
+            problem = upstream_proxy._check_protocol(host, server.server_address[1])
+            assert problem is not None and "协议版本过旧" in problem
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_unreachable_rejected(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        problem = upstream_proxy._check_protocol("127.0.0.1", port)
+        assert problem is not None and "不可达" in problem

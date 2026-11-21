@@ -16,10 +16,15 @@ from pathlib import Path
 import pytest
 
 from src.api.antigravity import (
+    UPSTREAM_BUILD_ENVELOPE_HEADER,
     _build_labels,
     _derive_upstream_session_ids,
     _generate_request_id,
     _reset_trajectory_request_seq,
+    build_envelope_parts,
+    compose_python_envelope,
+    compose_sidecar_body,
+    prepare_cli_request,
     wrap_cli_request,
 )
 
@@ -273,3 +278,73 @@ async def test_envelope_matches_captured_sample_shape():
     assert len(parts) == 5 and parts[0] == "agent"
     assert parts[1] == payload["request"]["labels"]["cascade_id"]
     assert parts[3] == payload["request"]["labels"]["trajectory_id"]
+
+
+class TestEnvelopePartsAndSidecar:
+    """信封下沉 Go 的结构化输入与双作曲架构。"""
+
+    def _set_impersonation(self, monkeypatch, enabled: bool):
+        async def _flag():
+            return enabled
+
+        monkeypatch.setattr(
+            "src.api.antigravity.get_upstream_tls_impersonation_enabled", _flag
+        )
+
+    async def test_parts_shape_and_labels_placeholder(self):
+        parts = await build_envelope_parts(_session_a_turn3(), MODEL, "proj")
+        keys = [key for key, _value in parts.inner_entries]
+        # chat(无 tools)内层键序:contents → systemInstruction → labels → sessionId
+        assert keys == ["contents", "systemInstruction", "labels", "sessionId"]
+        # labels 位是 None 占位(字节由 Go 产出)
+        assert dict(parts.inner_entries)["labels"] is None
+        assert parts.anchors["step"] == 5
+        assert parts.anchors["lastStepIndex"] == "4"
+        assert parts.anchors["requestIdLabel"] == f"{parts.trajectory_id}-0"
+        assert parts.anchors["cascadeId"] == parts.anchors["rootCascadeId"]
+        assert parts.request_type == "chat"
+
+    async def test_compose_python_envelope_matches_wrap(self):
+        """参照作曲与 wrap_cli_request 完全等价(同一序列计数下)。"""
+        _reset_trajectory_request_seq()
+        payload, rid = await wrap_cli_request(_session_a_turn3(), MODEL, "proj")
+        _reset_trajectory_request_seq()
+        parts = await build_envelope_parts(_session_a_turn3(), MODEL, "proj")
+        payload2, rid2 = compose_python_envelope(parts)
+        assert payload == payload2
+        assert rid == rid2
+
+    async def test_compose_sidecar_body_shape(self):
+        parts = await build_envelope_parts(_session_a_turn3(), MODEL, "proj")
+        body = compose_sidecar_body(parts)
+        assert body["model"] == MODEL
+        assert body["requestType"] == parts.request_type
+        assert body["project"] == "proj"
+        assert body["anchors"]["trajectoryId"] == parts.trajectory_id
+
+        entries = {key: value for key, value in body["innerEntries"]}
+        assert list(entries) == ["contents", "systemInstruction", "labels", "sessionId"]
+        assert entries["labels"] is None
+        # 值片是与 httpx json= 逐字节相同的紧凑 JSON 文本
+        contents_value = next(v for k, v in parts.inner_entries if k == "contents")
+        assert entries["contents"] == json.dumps(
+            contents_value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        )
+
+    async def test_prepare_cli_request_go_mode(self, monkeypatch):
+        self._set_impersonation(monkeypatch, True)
+        prepared = await prepare_cli_request(_session_a_turn3(), MODEL, "proj")
+        assert prepared.extra_headers == {UPSTREAM_BUILD_ENVELOPE_HEADER: "1"}
+        assert prepared.body["anchors"]["step"] == 5
+        assert prepared.body["project"] == "proj"
+        assert prepared.request_id == ""  # requestId 由 Go 构造
+
+    async def test_prepare_cli_request_python_mode(self, monkeypatch):
+        self._set_impersonation(monkeypatch, False)
+        prepared = await prepare_cli_request(_session_a_turn3(), MODEL, "proj")
+        assert prepared.extra_headers == {}
+        assert prepared.request_id.startswith("agent/")
+        assert prepared.body["request"]["labels"]["trajectory_id"] == prepared.trajectory_id
+        # 两种模式 project 改写位置统一(换凭证场景)
+        prepared.body["project"] = "proj2"
+        assert prepared.body["project"] == "proj2"

@@ -209,6 +209,7 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 
 **出站 TLS 指纹（Go 转发器）**
 - `UPSTREAM_TLS_IMPERSONATION`: 启用 Go 出站 TLS 转发器（默认：true）。开启后发往 Antigravity API 的请求经本机 Go 转发器出站，ClientHello（JA3/密码套件/扩展/PQ 曲线组/ALPN）与真实客户端逐段一致；转发器不可用时**直接报错不回退**（见严格模式）。服务运行期间有后台健康检查，本进程拉起的转发器意外退出会自动重启。
+- 开启时**上游报文（信封/labels/requestId）字节由 Go 转发器唯一构造**：Python 只传"内层值片 + 会话锚点"，转发器按实抓键序组装报文（协议版本经 `/__health` 握手，二进制过旧会被拒绝并提示重新编译——升级 Python 后必须同步重建/更新 Go 二进制）。关闭时由 Python 参照作曲直连 httpx。
 - `UPSTREAM_TLS_PROXY_URL`: 转发器监听地址（默认：`http://127.0.0.1:17890`）
 - `UPSTREAM_TLS_PROXY_BIN`: 手动指定转发器二进制路径（默认自动查找 `tools/upstream_tls_proxy/bin/`，同时支持本机构建的无后缀名与 release 的 `upstream-proxy-<goos>-<goarch>` 平台后缀名）
 

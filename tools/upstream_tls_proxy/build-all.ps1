@@ -1,4 +1,4 @@
-# 交叉编译全部发布目标（Windows 主机即可完成）。
+﻿# 交叉编译全部发布目标（Windows 主机即可完成）。
 # 需要 Go >= 1.26；纯静态（CGO_ENABLED=0），可在 musl/Termux 上直接运行。
 #
 # 用法: powershell -ExecutionPolicy Bypass -File .\tools\upstream_tls_proxy\build-all.ps1

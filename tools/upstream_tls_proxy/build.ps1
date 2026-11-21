@@ -1,4 +1,4 @@
-# 编译 Go 出站 TLS 转发器（需要 Go >= 1.26）
+﻿# 编译 Go 出站 TLS 转发器（需要 Go >= 1.26）
 #
 # 用法:
 #   powershell -ExecutionPolicy Bypass -File .\tools\upstream_tls_proxy\build.ps1

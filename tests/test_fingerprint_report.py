@@ -54,7 +54,7 @@ def build_antigravity_headers(access_token, extra_headers=None, model_name=""):
     return headers
 
 
-def wrap_cli_request(gemini_request, model, project_id):
+def compose_python_envelope(parts):
     payload = {
         "project": project_id,
         "requestId": request_id,

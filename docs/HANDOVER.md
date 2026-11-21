@@ -348,8 +348,35 @@ portable Go 1.27.4 编译的。临时目录不保证长期存在，接手者需�
 
 1. **P0 实测**：owner 用真实凭证跑 `tools/smoke_real_request.py` 四场景。
 2. **CI 验证**：push 到 origin 后确认 fidelity.yml 三平台绿、release.yml 打 tag 发产物。
-3. **P3.1 信封构造下沉 Go**（本轮明确推迟）：Python 拼 `wrap_cli_request` → Go 只发送的现状保持。
-4. **P2.4 观察项**：串行模式回合锁仍是全局（中间件层拿不到凭证）。
-5. `xhigh` 后缀 thinkingLevel：owner 确认 extra high 档位存在，但缺 xhigh 模型的 agent
+3. **P2.4 观察项**：串行模式回合锁仍是全局（中间件层拿不到凭证）。
+4. `xhigh` 后缀 thinkingLevel：owner 确认 extra high 档位存在，但缺 xhigh 模型的 agent
    请求实抓（上游报文档位字符串未证实）；抓到后按实抓字符串纳入档位校验。
-6. 版本号：`version.txt` 由 CI 自动 bump，无需手动改。
+5. 版本号：`version.txt` 由 CI 自动 bump，无需手动改。
+6. requestType "chat"：当前实现会对无工具请求产出 `chat`，而实抓三种形态
+   （agent/checkpoint/agent_monitoring）中没有 `chat`——是否属于保真度问题待 owner 拍板，
+   未在信封重构中改动。
+
+### 10.7 第二轮：信封构造下沉 Go（P3.1，owner 点单）
+
+目标达成：**上游报文字节只有一个作者**。协议（Python → Go，判别头
+`X-Upstream-Build-Envelope: 1`，Go 侧剥离）：
+
+- Python `build_envelope_parts`：严格校验、sessionId 注入、step 计算、签名回注、
+  labels 值（`_build_labels` 单一来源）、requestType/tools 判定、内层键序对齐，
+  产出 `EnvelopeParts`（有序值片 + 锚点）。**值片按 httpx json= 同参序列化为
+  JSON 文本字符串**，labels 位为 null 占位。
+- Go `envelope.go`：解码值片（自定义 UnmarshalJSON，`json.Compact` 校验）、
+  labels 九键/外层六键用 struct 声明序 + `json.Encoder SetEscapeHTML(false)`
+  （Go 默认转义 `<>&` 而 Python 不转义，必须关）、手工拼接内层帧并在原位产出
+  labels、requestId 五段（时间戳构造时取一次，重试复用同一 body，天然幂等）。
+- 两种作曲模式：impersonation 开启（默认）→ wrapper + 头 → Go 构造；
+  关闭 → `compose_python_envelope` 参照作曲直连 httpx。
+  `tests/test_go_envelope_bytes.py` 用真实二进制 + dummy 上游断言**两种模式
+  字节逐字节等价**（requestId 时间戳归一），并验证重试幂等性。
+- 兼容性握手：`/__health` 增加 `protocol:2`；`ensure_running` 拉起后校验，
+  旧二进制判不可用（严格模式拒绝启动），不会静默错发。**部署要求：升级后必须重建 Go 二进制**（CI/Docker 自动；release.yml 产物自动满足）。
+- 面板探活改走 `prepare_cli_request` 同一路径，并补 `account_salt=email`
+  （原先不同凭证探活派生相同会话，与真实请求不一致）。
+- 踩坑记录：`build.ps1`/`build-all.ps1` 中文注释无 BOM → PS 5.1 按 GBK 解析报
+  语法错误，已补 UTF-8 BOM（与 install.ps1 同类问题）。
+- 本机无系统 Go：portable Go 1.27.4 下载到仓库外临时目录，`build.ps1 -Go` 重建。

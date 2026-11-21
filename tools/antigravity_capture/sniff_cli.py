@@ -1300,12 +1300,13 @@ def parse_proxy_header_order(antigravity_py_text: str) -> List[str]:
 def parse_proxy_envelope_order(antigravity_py_text: str) -> Tuple[List[str], List[str]]:
     """提取顶层信封与内层 request 的键序。
 
-    信封只在 ``wrap_cli_request`` 的 payload dict 里找，避免命中源码其它位置的
-    同名字段；内层键序取 ``_align_inner_request_topology`` 的 key_order 列表。
+    信封只在 ``compose_python_envelope`` 的 payload dict 里找（Python 参照作曲，
+    与 Go 构造的字节逐字节等价），避免命中源码其它位置的同名字段；
+    内层键序取 ``_align_inner_request_topology`` 的 key_order 列表。
     """
     envelope: List[str] = []
     m = re.search(
-        r"def wrap_cli_request\(.*?payload\s*=\s*\{(.*?)\}\s*\n\s*return",
+        r"def compose_python_envelope\(.*?payload\s*=\s*\{(.*?)\}\s*\n\s*return",
         antigravity_py_text,
         re.S,
     )
