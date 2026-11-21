@@ -1,4 +1,4 @@
-full_hash=af8061403af9630b23556984c0f0e5f160697483
-short_hash=af80614
-message=Merge branch 'master' of https://github.com/iris1598/agy2api
-date=2026-11-21 20:19:20 +0800
+full_hash=09234206348a6b1be538c7071b28cc289323ebe9
+short_hash=0923420
+message=三大增强落地:2)注册表全字段学习(_PARAM_KEYS 8 键/顶层直取防嵌套误命中/parse_model_quota 每模型额度),默认注入改 get_model_param 优先——消偏差二全集(claude 128000/neon 262144/sonar 65536/2.5 系 65535/gpt-oss 32768),thinkingLevel 注册表值优先(1/2/3→字符串,100→数值,xhigh=100 出处在注册表),disabled 模型 fail-closed 拒绝,quota_budget 双路信号(桶+模型 quotaInfo 零额外请求);1)countTokens 真实计数:fetch_upstream_token_count 按 proto schema 构造,双端点(/v1/messages/count_tokens+:countTokens)升级,失败回落估算,COUNT_TOKENS_UPSTREAM 可关;3)串行回合锁按凭证下沉:keyed acquire_turn_for(LRU 4096/跨 loop 重建保计时),_stream_with_credential_slot+非流式接锁,中间件卸载全局回合锁——真实客户端串行是每实例内串行,旧全局锁跨账号互阻;258 passed
+date=2026-11-21 21:46:33 +0800
