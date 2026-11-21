@@ -275,10 +275,74 @@ portable Go 1.27.4 编译的。临时目录不保证长期存在，接手者需�
 
 ## 9. 交接完成验收清单
 
-- [ ] 工作区已提交（含 `fidelity_schema.json`、`tools/`；`.zcode/` 处理掉）
-- [ ] `pytest -q` 全绿
-- [ ] `verify --envelope` 通过
-- [ ] P0 真实请求三类场景全部 200，日志无回退/拒绝
-- [ ] CI workflow 至少跑通一次
-- [ ] 源码安装脚本在无 Go 环境下行为明确（报错或自动获取二进制）
-- [ ] README/抓包 README 与实际行为一致
+- [x] 工作区已提交（含 `fidelity_schema.json`、`tools/`；`.zcode/` 已加入 `.gitignore`）
+- [x] `pytest -q` 全绿（2026-11-21：204 passed, 1 skipped）
+- [x] `verify --envelope` 通过
+- [ ] P0 真实请求四类场景全部 200（**smoke 脚本已就绪，待 owner 手动执行**，见 10.1）
+- [ ] CI workflow 至少跑通一次（**本轮只本地提交未推送**；push 到 origin 后 fidelity.yml 自动触发）
+- [x] 源码安装脚本在无 Go 环境下行为明确（自动下载 Release 二进制 + SHA256 校验，失败时本地编译/明确报错）
+- [x] README/抓包 README 与实际行为一致
+
+---
+
+## 10. 本轮改进记录（2026-11-21，接手后第一轮）
+
+范围：P0(脚本) / P1 / P2 / P3(除信封下沉) / P4，全部已本地提交（未 push）。
+
+### 10.1 P0 — 真实端到端冒烟脚本（未实测，消耗额度为零）
+
+- 新增 `tools/smoke_real_request.py`：四场景（basic 流式 / tools / `-low` 后缀 / Claude），
+  默认读配置端口与 `api_password`，`--spawn` 可自动拉起 web.py；
+  预检 `/v1/models`（不消耗额度），出现 `fidelity_rejected` 时打印 reason/detail。
+  **owner 待办**：`.\.venv\Scripts\python.exe tools\smoke_real_request.py`（会消耗少量额度）。
+
+### 10.2 P1 — 模型参数表与 thinking 归一化
+
+- `src/model_enum.py` 新增 `MODEL_PARAMS` 种子表（实抓证据：gemini-2.5-flash 65535、
+  gemini-4-hydrogen 主力档 262144）+ `parse_model_params`/`merge_model_params`/`get_model_param`
+  运行时学习（接入点 `fetch_credential_models`）。
+- `src/fidelity.py`：thinkingLevel 合法集合补 **MINIMAL**；新增 maxOutputTokens 严格校验
+  （超实抓上限 → `generation_config_mismatch`；**代理默认值 65536/64000 豁免**——否则
+  gemini-2.5-flash 的实抓上限 65535 会误杀默认请求）。`xhigh` 后缀无 agent 信封实抓证据，
+  暂不参与校验（待抓包补证）。
+- `src/converter/antigravity_fix.py`：非严格模式对超限显式值钳制（严格模式交 fidelity 拒绝）。
+  `_normalize_generation_config` 因此改为 async。
+
+### 10.3 P2 — 防封剩余项
+
+- 新增 `src/quota_budget.py`：web.py lifespan 后台任务定期复用 `fetch_quota_info` 刷新额度，
+  低于阈值（`QUOTA_BUDGET_THRESHOLD`，默认 0.1）在 `get_valid_credential` 前置剔除；
+  数据过期 fail-open。注意 `fetch_quota_info` 在 refresh_all 内延迟导入（循环依赖）。
+- `src/api/utils.py`：429/500/503 重试改为**指数退避 + 抖动**（按账号连续失败计数，
+  成功清零；`BACKOFF_ENABLED`/`BACKOFF_MAX_DELAY`）。上游明确冷却仍优先（模型级冷却 + 换号）。
+- 新增 `src/model_mix.py`（默认关）：高价模型每日上限（`get_valid_credential` 前置过滤）+
+  恒定速率 warning（每账号每小时最多一次）。
+- 全局串行回合锁语义**未动**（P2.4 观察项：要彻底 per-credential 串行需把回合锁下移到凭证选择后）。
+
+### 10.4 P3 — Go 核心收尾（信封下沉除外）
+
+- `src/upstream_proxy.py`：`find_binary` 支持平台后缀产物名（与 build-all 命名对齐）；
+  新增后台健康检查 `health_monitor`（本进程拉起的转发器退出自动重启）+ `status()`；
+  web.py lifespan 启停。
+- 新增 `.github/workflows/release.yml`：push `v*` 标签 → build-all 7 平台 + SHA256SUMS.txt
+  → GitHub Release（gh CLI，无第三方 action）。
+- 四个安装脚本（install.ps1 / install.sh / darwin-install.sh / termux-install.sh）：
+  无二进制时优先下载 `releases/latest/download/<平台产物>` + SHA256 校验（macOS 清 quarantine，
+  校验不匹配视为致命），失败回退本地编译指引，行为明确。
+  **注意 install.ps1 已加 UTF-8 BOM**（PS 5.1 无 BOM 按 GBK 解析中文会破坏语法）。
+- README 已同步（回退措辞改为"直接报错"、新配置项、二进制获取三途径）。
+
+### 10.5 P4 — 卫生
+
+- `.gitignore` 加 `.zcode/`；修正 httpx_client / upstream_proxy 的过期"回退 httpx"注释。
+- `.env.example` 登记全部新环境变量（STRICT_FIDELITY / UPSTREAM_TLS_* / BACKOFF_* /
+  QUOTA_BUDGET_* / MODEL_MIX_* / CREDENTIAL_MAX_CONCURRENT）。
+
+### 10.6 遗留（下一轮候选）
+
+1. **P0 实测**：owner 用真实凭证跑 `tools/smoke_real_request.py` 四场景。
+2. **CI 验证**：push 到 origin 后确认 fidelity.yml 三平台绿、release.yml 打 tag 发产物。
+3. **P3.1 信封构造下沉 Go**（本轮明确推迟）：Python 拼 `wrap_cli_request` → Go 只发送的现状保持。
+4. **P2.4 观察项**：串行模式回合锁仍是全局（中间件层拿不到凭证）。
+5. `xhigh` 后缀 thinkingLevel：待抓包补证后再决定是否纳入校验。
+6. 版本号：`version.txt` 由 CI 自动 bump，无需手动改。
