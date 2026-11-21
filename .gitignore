@@ -110,5 +110,10 @@ log.txt
 tools/antigravity_capture/captures/
 tools/antigravity_capture/logs/
 tools/upstream_tls_proxy/bin/
+# Antigravity 客户端副本与静态逆向 dumps 不入库；只保留 _rev 下的逆向脚本
+tools/antigravity/
+tools/_rev/*
+!tools/_rev/*.py
+!tools/_rev/*.md
 aicode/
 streamchat/

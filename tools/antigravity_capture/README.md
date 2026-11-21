@@ -20,6 +20,10 @@ TLS 指纹。**所有指纹结论以本目录工具实抓的数据为准，不�
    `language_server.log` 会打印
    `Overriding CloudCodeServerURL via CLOUD_CODE_URL environment variable: "..."`，
    之后 `/v1internal:*` 请求全部发到指定地址。
+   静态逆向（2026-11-21，`tools/_rev`）发现等价的**命令行参数**路径：
+   Electron 用 `--cloud_code_endpoint https://daily-cloudcode-pa.googleapis.com`
+   启动 LS（见 `tools/_rev/README.md`），理论上可从命令行覆盖——未实测，
+   重定向仍以 `CLOUD_CODE_URL` 为准。
 2. **token 刷新不走 `CLOUD_CODE_URL`**：LS 始终直接 POST
    `https://oauth2.googleapis.com/token`。因此**离线/重定向捕获的前提是 LS 能连上
    Google**（开 Clash TUN，或给 Antigravity 进程注入

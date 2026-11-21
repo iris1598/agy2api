@@ -77,19 +77,23 @@ class UpstreamSessionIds(NamedTuple):
     cascade_id: str
 
 
-def _derive_install_session_id(account_salt: str = "") -> str:
-    """装机级稳定 sessionId（实抓 163547/193455：两个不同会话（不同 cascade/
-    trajectory）的 sessionId 同为 ``-3750763034362895579``——真实客户端的
-    sessionId 不随对话变化，一个安装一个值，非逐对话派生）。
+# 装机级 sessionId 常量（静态逆向 + 实抓双重证据，2026-11-21）：
+# int64(-3750763034362895579) 的无符号形态正是 Go hash/fnv64a 的 offset basis
+# ``0xCBF29CE484222325``——真实 LS 是对**空输入**做 FNV-1a64 后转 int64（哈希
+# 对象从未写入字节）。FNV-1a64 对任何非空输入都不可能回到 basis（每个字节都会
+# 改变状态），因此该值是全体客户端装机恒等的常量，不是机器/凭证派生值。
+# 实抓 163547/193455 两个不同会话的 sessionId 与该常量逐字节一致。
+OFFICIAL_SESSION_ID = "-3750763034362895579"
 
-    代理侧按凭证派生：一个凭证 = 一个客户端安装，跨会话/跨重启恒定；
-    无账号盐时退化为全局常量（单凭证部署等效）。仍保持 -{int} 形态。
+
+def _derive_install_session_id(account_salt: str = "") -> str:
+    """装机级稳定 sessionId：全体客户端共用的常量（见 ``OFFICIAL_SESSION_ID``）。
+
+    ``account_salt`` 仅保留签名兼容，不再参与派生——真实客户端的所有安装
+    （包括我们的多账号）都发送同一个值，逐凭证派生反而偏离真实画像；
+    会话隔离本就由 trajectory_id / cascade_id 承担（实抓证实）。
     """
-    digest = hashlib.sha256(
-        b"upstream-session:" + (account_salt or "").encode("utf-8")
-    ).digest()
-    session_int = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
-    return f"-{session_int}"
+    return OFFICIAL_SESSION_ID
 
 
 def _derive_upstream_session_ids(
@@ -98,8 +102,8 @@ def _derive_upstream_session_ids(
     """
     确定性派生上游 (sessionId, trajectory_id, cascade_id)。
 
-    - sessionId：装机级稳定（`_derive_install_session_id`，实抓证实真实客户端
-      跨会话恒定），按凭证派生隔离多账号；
+    - sessionId：全体客户端恒等的常量（`OFFICIAL_SESSION_ID`，静态逆向证实
+      = FNV-1a64 空输入 basis；实抓 163547/193455 跨会话同值），不再按凭证派生；
     - trajectory_id / cascade_id：逐对话派生——联合锚点 =
       SHA256(model + systemInstruction 文本 + 前两条消息特征)，与
       derive_session_key 同口径，保证同一会话跨轮次恒定（KV 缓存路由亲和）、

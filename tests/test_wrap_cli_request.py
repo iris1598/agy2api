@@ -2,7 +2,7 @@
 
 覆盖:
 - 同一会话跨轮次 → sessionId / trajectory_id / labels 恒定（仅 requestId 时间戳段变化）
-- sessionId 装机级稳定（实抓 163547/193455：跨会话/跨模型恒定，按凭证派生隔离）
+- sessionId 全体客户端恒等的常量（静态逆向：FNV-1a64 空输入 basis，实抓 163547/193455 同值）
 - 共用 systemInstruction 的不同会话 → trajectory/cascade 隔离
 - 不同模型 → trajectory/cascade 隔离
 - step 随模型轮数递增，同步写入 requestId 末段与 labels
@@ -11,6 +11,7 @@
 """
 import json
 import os
+import struct
 import uuid
 from pathlib import Path
 
@@ -285,19 +286,21 @@ async def test_different_model_isolated():
     assert pa["request"]["labels"]["trajectory_id"] != pb["request"]["labels"]["trajectory_id"]
 
 
-def test_install_session_id_stable_and_salt_isolated():
-    """sessionId 按凭证派生：跨对话/跨模型恒定，换账号盐即换值（多账号隔离）。"""
+def test_install_session_id_is_official_constant():
+    """sessionId 全体客户端恒等的常量（静态逆向 2026-11-21：真实 LS 对空输入做
+    FNV-1a64 → offset basis 0xCBF29CE484222325 = int64 -3750763034362895579；
+    实抓 163547/193455 同值）。换账号盐也不变，会话隔离由 trajectory/cascade 承担。"""
     ids_a = _derive_upstream_session_ids(_session_a_turn1(), MODEL, "cred-1")
     ids_b = _derive_upstream_session_ids(_session_b(), MODEL, "cred-1")
-    ids_c = _derive_upstream_session_ids(
-        _session_a_turn1(), "claude-sonnet-5-5-medium", "cred-1"
-    )
     ids_other = _derive_upstream_session_ids(_session_a_turn1(), MODEL, "cred-2")
-    assert ids_a.session_id == ids_b.session_id == ids_c.session_id
-    assert ids_a.session_id != ids_other.session_id
-    # 无账号盐退化为全局常量形态
+    expected = struct.unpack("<q", struct.pack("<Q", 0xCBF29CE484222325))[0]
+    assert ids_a.session_id == ids_b.session_id == ids_other.session_id
+    assert ids_a.session_id == str(expected) == "-3750763034362895579"
+    # 无账号盐同样得到该常量
     ids_no_salt = _derive_upstream_session_ids(_session_a_turn1(), MODEL, "")
-    assert ids_no_salt.session_id.startswith("-")
+    assert ids_no_salt.session_id == "-3750763034362895579"
+    # 隔离信号在 trajectory/cascade：同内容不同盐 → 不同轨迹
+    assert ids_a.trajectory_id != ids_other.trajectory_id
     uuid.UUID(ids_a.trajectory_id)
     uuid.UUID(ids_a.cascade_id)
 

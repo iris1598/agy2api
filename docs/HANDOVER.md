@@ -530,3 +530,61 @@ owner 新抓 20261121-193455（新会话只发一句"你好"，extra high 档位
 
 **pytest 232 passed**（+4：requestType/装机 sessionId/hydrogen 默认值各一组）；
 `verify --envelope --json` 全绿。本地领先 origin 3 个提交（d94af71/ec55092/本轮）。
+
+### 10.12 第七轮：客户端副本静态逆向（tools/_rev，2026-11-21）
+
+owner 提供 Antigravity 客户端副本（`tools/antigravity/`，不入库）。本轮对
+Electron `app.asar`（主进程 JS）与 `language_server.exe`（Go 1.28 boringcrypto，
+207MB）做**只读静态逆向**，工具与说明见 `tools/_rev/README.md`（脚本已入库，
+dumps/schema 文本留在本地）。不用抓包就拿到了一批字段级地面真值：
+
+1. **sessionId 算法破译（§10.11 第 2 点的升级，已落地）**：
+   int64(-3750763034362895579) 的无符号形态恰为 Go `hash/fnv64a` 的 offset
+   basis `0xCBF29CE484222325`——真实 LS 对**空输入**做 FNV-1a64 后转 int64
+   （哈希对象从未写入字节）。FNV-1a64 任何非空输入都不可能回到 basis
+   （逐字节改变状态），故该值是**全体客户端恒等的常量**，不是装机/凭证派生值。
+   实现：`src/api/antigravity.py` 新增 `OFFICIAL_SESSION_ID` 常量，
+   `_derive_install_session_id` 不再 sha256 派生、不再区分凭证（account_salt
+   仅保留签名兼容）；会话隔离本就由 trajectory/cascade 承担。
+   测试 `test_install_session_id_is_official_constant`（断言常量值 = FNV basis
+   int64，且跨盐恒定、trajectory 仍按盐隔离）。**pytest 232 passed**，
+   `verify --envelope --json` 全绿。
+2. **外层信封 proto 全 schema 还原**（`v1internal/prediction_service.proto`）：
+   `GenerateContentRequest = {project, requestId, request, model,
+   userPromptId(5), userAgent, requestType, enabledCreditTypes(8)}`。
+   实抓复核（163547/193455 全部 generateContent 请求）：真实客户端 agent 路径
+   **从不设置** `userPromptId` / `enabledCreditTypes`——代理保持不注入是对的；
+   两字段记录在案，未来若上游启用（如按 prompt 计费）需要跟进实抓。
+   内层 `aiplatform.master.GenerateContentRequest` 全字段（labels=10,
+   sessionId=13, generationConfig=4…）与实抓键序一致。
+3. **ThinkingConfig 权威枚举**：`LOW=1/MEDIUM=2/HIGH=3/MINIMAL=4/EXTRA_HIGH=5/
+   MAX=6/XHIGH=7`。xhigh 实抓 JSON 值 100 是客户端自定义变换（wire 枚举 XHIGH=7），
+   代理保持实抓口径；MINIMAL 仍不进 agent 路径合法集（实抓 0 次，§10.2 口径不变）。
+   另发现 `prefixMismatchBehavior`（ERROR/DROP）等字段，供上游排错参考。
+4. **系统提示词模板本体已还原**：Go text/template，含
+   `{{if .ExperimentEnabled "generic-system-prompt"}}` 等实验门控与
+   `IsAutonomous` 分支（§10.9.6 sys 会话内演化的根源 = 模板 + 实验开关 +
+   渲染上下文，不是客户端随机改动）。模板文本在本地 `tools/_rev/prompt_region.txt`
+   （Google 客户端内容，不入库）。**§10.9.6 修复方向随之明确**：trajectory 锚点
+   不应包含 systemInstruction 全文（同一会话跨实验开关就会断锚）——候选方案：
+   锚点只用 model + 首条 user 消息 + (可选) sys 的稳定前缀。
+5. **端点全集 63 个 `/v1internal:*`**（含实抓未见过的 `countTokens`、
+   `retrieveUserQuota`（按模型 remainingFraction）、`fetchFromTrawlerCache`、
+   `internalAtomicAgenticChat` 等，完整清单见本地 `ls_strings.txt` /
+   `tools/_rev`）。后续候选：token_estimator 可改用 `countTokens` 真实计数；
+   quota_budget 可评估 `retrieveUserQuota` 粒度。
+6. **模型宇宙远大于 39 枚举**：二进制内置 fallback 模型注册表含
+   `claude-opus-5-5(-low/-high/-max)`、`claude-sonnet-5-5`、`gemini-3.5~3.8-flash`
+   家族、`gemini-4-carbon/neon/argon` 家族等。strict 模式枚举仍以
+   fetchAvailableModels 实抓为准；此表作为"新模型上线预警清单"价值更大。
+7. **基础设施情报**：LS 启动参数全集（`--cloud_code_endpoint` 是 `CLOUD_CODE_URL`
+   的命令行等价物，未实测）；`ANTIGRAVITY_*/AGY_*` 环境变量全集；3 个 OAuth
+   Client ID（`884354919052-*`、`1071006060591-*`、`1098991175725-*`，仅记录，
+   代理 OAuth 流程不需要）；UA 构成 = `--override_user_agent_name antigravity`
+   + `--subclient_type hub` + LS build label + `--stamp` 的 CL
+   （`1026637980` 在二进制中出现 5 次，与 `src/utils.py` 一致）。
+8. `.gitignore`：`tools/antigravity/` 与 `tools/_rev/*` 不入库（保留 `*.py`/`*.md`）。
+
+> 下轮候选：§10.9.6 trajectory 锚点修复（4）、`countTokens`/`retrieveUserQuota`
+> 接入（5）、新模型预警清单维护（6）。静态逆向产物（dumps/schema/prompt 文本）
+> 仍在 `tools/_rev/` 本地目录，升级客户端版本后可用 `tools/_rev` 脚本重跑。
