@@ -37,14 +37,19 @@ TLS 指纹。**所有指纹结论以本目录工具实抓的数据为准，不�
    `{"project", "metadata": {"updateChannel": "stable"}}`；
    `fetchUserInfo` / `fetchAvailableModels` → `{"project"}`；
    `writeTrajectoryAcls`（2.34.0 新增）→ `{"trajectoryId": "<uuid>"}`，响应 `{}`。
-6. **2.34.0 新增 `requestType: "checkpoint"`**：`requestId` 形如
-   `checkpoint/<uuid>`，模型如 `gemini-3.5-flash-lite`，无 `labels`。
-   常规智能体请求仍是 `agent/<cascade>/<ms>/<trajectory>/<step>`。
-   另外 2.34.0 的 `labels` **不再包含 `last_execution_id`**（共 9 个键）。
-6.1 **step 与 request_id 规律（20261121 样本全序列核对）**：
-   - `step = 1 + 2 × (contents 中 role=="model" 的消息数)`；
-     0 条 model → step 1，1 条（含工具调用）→ step 3，2 条 → step 5；
-     101904 的 193 条 contents / 192 条 model → step 385，完全吻合；
+6. **2.34.0 的 `requestType` 三形态**：`agent`（常规对话，`requestId` 形如
+   `agent/<cascade>/<ms>/<trajectory>/<step>`）/ `checkpoint`（`checkpoint/<uuid>`，
+   flash-lite，无 labels，contents 只带原始用户文本）/ `agent_monitoring`
+   （见 6.2）。**对话请求一律 agent，`chat` 在实抓中 0 次出现**（193455 问候
+   抓包复核：纯文本也是 agent + 16 工具声明）。
+   `labels` 九键或十键（含 `last_execution_id`，见 6.3）。
+6.1 **step 与 request_id 规律（20261121-163547 真实转发会话 33 条 agent 请求
+   全序列拟合；推翻本节旧公式 `1 + 2×model 消息数`——那是离线样本的巧合）**：
+   - `step = user 轮数 + 非(纯 functionResponse)的 model 轮数
+     + functionCall part 数`（fr 不计轮，**并行调用按 part 数计**）；
+   - step 不是纯 contents 函数：**contents 未推进的重复请求 = 客户端重发，
+     step +1 且此后轨迹永久带该偏移**（163547 的 0013 请求 502 失败 → 0014
+     原样重发，step 1→2）；
    - `labels.last_step_index = step - 1`；
    - `labels.request_id` 后缀是 trajectory 内**从 0 开始**的逐请求计数；
    - 工具调用 part 形如
@@ -62,6 +67,20 @@ TLS 指纹。**所有指纹结论以本目录工具实抓的数据为准，不�
      `gemini-4-hydrogen-sonar`，`thinkingLevel` 可以是 `MINIMAL`，且**没有 labels**；
      内层键为 `contents → systemInstruction → generationConfig → sessionId`（无 tools）；
    - `invoke_subagent` 的 functionCall / functionResponse 共享同一个 `id`。
+6.3 **labels 十键 `last_execution_id`（163547/193455 实抓闭环）**：
+   - 值由**客户端本地生成**（uuid4），不出现在任何上游响应中；
+   - 存在"最后一个 user 轮之前的 functionResponse 轮"时携带；同一工具轮在
+     同一 user 周期内保持同值，新 user 轮开启后更替；
+   - 键序在 `cascade_id` 之后（字母序）；
+   - 实现口径见 `src/api/antigravity.py` 的 `_resolve_last_execution_id`。
+6.4 **thinkingLevel 形态（193455 实抓）**：hydrogen 系 low/medium/high 为
+   字符串 `"LOW"/"MEDIUM"/"HIGH"`；**xhigh（extra high）为数值 `100`**；
+   flash-lite 心跳为 `"LOW"`/`"MINIMAL"` 字符串。hydrogen 系
+   maxOutputTokens 统一 262144。
+6.5 **sessionId 装机级稳定**：163547 与 193455 两个不同会话（不同
+   cascade/trajectory）的 sessionId 同为 `-3750763034362895579`——真实客户端
+   不按对话换 sessionId。
+
 7. LS→回环捕获服务器走 HTTP/1.1（回环链路产物）；真实上游协议以 ALPN 实测为准，见第 8 条。
 8. **真实 TLS 指纹（tlsproxy 实测，2026-11-21 在 2.34.0 上复测未变）**：LS 对 `daily-cloudcode-pa.googleapis.com`
    等全部 API 域名的 ClientHello JA3 完全一致：
