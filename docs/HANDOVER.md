@@ -415,3 +415,7 @@ step 规律（`step = 1 + 2×(contents 中 role=="model" 的消息数)`，"192 �
    skip 的 `test_envelope_matches_captured_sample_shape` 现已真正运行。
    `test_go_envelope_bytes.py` 三个测试（格式环/实抓环/字节等价环）全部基于
    最新有效样本。
+
+> **下一窗口任务**（owner 用 Antigravity 做真实开发项目并抓全过程）：
+> 见 `docs/HANDOVER_CAPTURE.md`——含抓取操作、last_execution_id 闭环预案、
+> 分析步骤与已踩坑清单。
