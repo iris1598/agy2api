@@ -258,7 +258,9 @@ portable Go 1.27.4 编译的。临时目录不保证长期存在，接手者需�
 8. **账号盐**：`_derive_upstream_session_ids` 混入 `account_salt`（凭证名），
    同一段内容在不同账号下不会撞 trajectory；改派生逻辑时保持这一点。
 9. **不要伪造内容**：systemInstruction / tools / 对话包装 / transcript 一律透传，
-   不编造（owner 明确要求）。
+   不编造（owner 明确要求）。user 轮的 `<USER_REQUEST>` 格式包装是例外——
+   实抓证明它是客户端的确定性格式（见 §10.13），复现格式不属于编造，
+   原始 user 文本仍一字不改。
 10. **转发模式抓包**会真的发请求；不要长期挂着当日常使用。
 
 ---
@@ -588,3 +590,68 @@ dumps/schema 文本留在本地）。不用抓包就拿到了一批字段级地�
 > 下轮候选：§10.9.6 trajectory 锚点修复（4）、`countTokens`/`retrieveUserQuota`
 > 接入（5）、新模型预警清单维护（6）。静态逆向产物（dumps/schema/prompt 文本）
 > 仍在 `tools/_rev/` 本地目录，升级客户端版本后可用 `tools/_rev` 脚本重跑。
+
+### 10.13 第八轮：USER_REQUEST 包装破译与落地（2026-11-21，owner 指示"继续"）
+
+对既有实抓（163547/193455）做**内容维度**复查（此前各轮只对齐了
+labels/step/header/TLS，从未校验 user 文本形态），发现并修复了一个每个请求
+都存在的系统性偏差：
+
+1. **实抓规律（163547 57 条 + 193455 3 条，逐条分类复核）**：
+   - **agent 请求的全部 user 轮都带包装**（含历史旧轮，无例外）：
+     `<USER_REQUEST>\n{原文}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n
+     The current local time is: {ISO8601 本地时区}.\n</ADDITIONAL_METADATA>`；
+   - 包装在该轮**首次发送时定格**，此后逐字节回放：0080 的 contents[0]
+     时间仍是首轮 0013 的 `16:40:48`、contents[50] 是 0074 的 `16:52:43`、
+     contents[56] 是新轮的 `16:55:16`；0013 失败后 0014 原样重发同值；
+   - `<USER_SETTINGS_CHANGE>` 只在 UI 改设置事件那一轮出现（两份实抓分别是
+     Model Selection 档位变更），**代理无对应事件，按"不伪造"永不注入**；
+   - `checkpoint`/`agent_monitoring` 请求带裸文本（代理不发送这两类）；
+   - 静态侧印证：系统提示词模板明确写着 "User requests are enclosed within
+     `<USER_REQUEST>` tags"，且模板含 `<INITIAL_USER_REQUEST>`、
+     `<COMPACTED_HISTORY>` 等同名段落标签。
+2. **落地**（`src/api/antigravity.py`）：
+   - `_wrap_user_turn_text`（幂等：已包装文本原样返回，实抓重放/黄金样本
+     不受影响）+ `_wrap_user_turns`（只包装 role=user 的 text part；空文本
+     跳过；图片生成模型无实抓证据整体跳过）；
+   - 时间戳用**轨迹级"首次见到即盖戳"注册表**（键 = sha256(text)，与索引
+     无关——调用方删改历史轮不破坏既有轮的戳值；LRU 上限 512 轨迹×256 轮，
+     随 `_reset_trajectory_request_seq` 一并重置）。 driving 轮首次出现即
+     盖当前墙钟戳，与真实客户端语义一致；注册表与 step 重发偏移同一失败
+     模式（重启丢失→时间跳变一次后重新稳定）；
+   - 插入点在 `build_envelope_parts`：严格校验（看原始请求）与锚点派生
+     （raw 口径）之后、step/labels 之前；敏感词过滤在转换层先行（包装文本
+     本身不参与过滤）。
+3. **测试**：新增 5 个（实抓格式逐字节正则、跨请求稳定、实抓重放幂等、
+   图片模型跳过、改写重盖戳/删除保戳）；**pytest 237 passed**；
+   `verify --envelope --json` 全绿。过期注释清理：`build_envelope_parts`
+   中残留的"纯文本 → chat"分支描述（§10.11 已删除该分支）。
+4. **schema 解码补充**（静态逆向直接产出，不再依赖逐字段实抓推断）：
+   - `model_configs.proto`：`ModelDetails` 全字段——displayName/supportsImages/
+     supportsThinking/**thinkingBudget/minThinkingBudget**/recommended/
+     maxTokens/maxOutputTokens/tokenizerType/quotaInfo/beta/disabled/
+     model(枚举)/supportsRawThinking/supportsVideo/supportsPdf…。
+     P1 模型参数表的运行时学习（`model_enum.parse_model_params`）可按此
+     扩容为全字段学习；`FetchAvailableModelsRequest` 还有 requestId/location
+     两个可选字段（实抓中未设置）。
+   - `quota_summary.proto`：`QuotaSummaryBucket{bucketId, displayName,
+     description, window, remainingFraction, remainingAmount, disabled,
+     resetTime}`——quota_budget 的字段级依据。
+   - **Model 枚举权威全表**：`.exa.codeium_common_pb.Model` 共 1691 值
+     （`MODEL_PLACEHOLDER_M0~`、`MODEL_OPENAI_GPT_OSS_120B_MEDIUM=342` 等），
+     完整清单在本地 `tools/_rev/model_enum_full.txt`。strict 模式仍以
+     fetchAvailableModels 实抓为准；此表是"新模型上线预警清单"的完整底册。
+   - 系统提示词模板门控全景：`ExperimentEnabled` 只出现 4 个旗标
+     （`generic-system-prompt`×7、`jetski-generative-ui`、
+     `jetski-generative-ui-prompt`、`enable-url-artifacts`），
+     上下文字段只有 `IsAutonomous`、skills 注入（`Data.Skills`）与
+     cascade 配置——§10.9.6 的 sys 演化维度就此完全枚举。
+5. **决策记录——"caller 无 tools 时注入真实 16 工具集"评估后不采纳**：
+   现已拥有实抓的完整工具声明（163547/0013），注入技术上可行且内容真实，
+   但真实客户端的工具集由客户端 agent 循环执行（run_command 等），无工具
+   的 OpenAI 调用方无法执行 functionCall，注入会破坏 API 契约。维持
+   §10.11 的透传口径。
+
+> **遗留**：`docs/HANDOVER.md` §3.9"对话包装一律透传，不编造"的表述已被
+> 本轮升级——实抓证据表明真实客户端对 user 轮有确定性格式包装，复现该
+> 格式不是编造；原始 user 文本仍一字不改（只加包装壳 + 客户端本地时间戳）。

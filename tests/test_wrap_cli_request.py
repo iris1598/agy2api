@@ -8,9 +8,11 @@
 - step 随模型轮数递增，同步写入 requestId 末段与 labels
 - 客户端显式 sessionId 透传
 - labels 键序与 requestType 判定不受影响
+- user 轮 <USER_REQUEST> 包装（实抓 60 条无例外）+ 首见盖戳稳定性 + 幂等
 """
 import json
 import os
+import re
 import struct
 import uuid
 from pathlib import Path
@@ -507,3 +509,82 @@ class TestEnvelopePartsAndSidecar:
         # 两种模式 project 改写位置统一(换凭证场景)
         prepared.body["project"] = "proj2"
         assert prepared.body["project"] == "proj2"
+
+
+# ==================== user 轮 <USER_REQUEST> 包装(§10.13) ====================
+
+
+async def test_user_turn_wrapped_like_real_client():
+    """user 轮按实抓格式包装(163547/193455 全部 60 条 agent 请求,无例外):
+
+    <USER_REQUEST>\n{原文}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n
+    The current local time is: {ISO8601 本地时区}.\n</ADDITIONAL_METADATA>
+    逐字节对照实抓 0013/0074;USER_SETTINGS_CHANGE 是 UI 事件,代理永不注入。
+    """
+    p, _ = await wrap_cli_request(_session_a_turn1(), MODEL, "proj")
+    text = p["request"]["contents"][0]["parts"][0]["text"]
+    m = re.fullmatch(
+        r"<USER_REQUEST>\n帮我重构这个模块\n</USER_REQUEST>\n"
+        r"<ADDITIONAL_METADATA>\nThe current local time is: "
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2})\.\n"
+        r"</ADDITIONAL_METADATA>",
+        text,
+    )
+    assert m, repr(text)
+
+
+async def test_user_wrap_stable_across_requests():
+    """历史 user 轮包装逐字节稳定(实抓 0080:contents[0] 时间仍是首轮 0013 值)。"""
+    p1, _ = await wrap_cli_request(_session_a_turn1(), MODEL, "proj")
+    first_wrapped = p1["request"]["contents"][0]["parts"][0]["text"]
+    p3, _ = await wrap_cli_request(_session_a_turn3(), MODEL, "proj")
+    assert p3["request"]["contents"][0]["parts"][0]["text"] == first_wrapped
+    # 三个 user 轮各自有包装;时间戳随首次见到定格,不同轮时间可不同
+    texts = [
+        c["parts"][0]["text"]
+        for c in p3["request"]["contents"]
+        if c["role"] == "user"
+    ]
+    assert all(t.startswith("<USER_REQUEST>\n") for t in texts)
+    assert len({t for t in texts}) == 3
+
+
+async def test_user_wrap_idempotent_with_captured_sample():
+    """实抓重放(已包装文本)原样通过,绝不二次包装(黄金样本 163547/0080 形态)。"""
+    captured = (
+        "<USER_REQUEST>\n你好\n</USER_REQUEST>\n"
+        "<ADDITIONAL_METADATA>\n"
+        "The current local time is: 2026-11-21T19:35:25+08:00.\n"
+        "</ADDITIONAL_METADATA>\n"
+        "<USER_SETTINGS_CHANGE>\n"
+        "The user changed setting `Model Selection` from None to "
+        "Gemini 4 Hydrogen (XHigh). No need to comment on this change if the "
+        "user doesn't ask about it. If reporting what model you are, please use "
+        "a human readable name instead of the exact string.\n"
+        "</USER_SETTINGS_CHANGE>"
+    )
+    p, _ = await wrap_cli_request(_req([{"role": "user", "parts": [{"text": captured}]}]), MODEL, "proj")
+    assert p["request"]["contents"][0]["parts"][0]["text"] == captured
+
+
+async def test_user_wrap_skipped_for_image_models():
+    """图片生成模型无实抓包装证据,整体跳过(无证据不注入)。"""
+    p, _ = await wrap_cli_request(
+        _session_a_turn1(), "gemini-2.5-flash-image", "proj"
+    )
+    assert p["request"]["contents"][0]["parts"][0]["text"] == "帮我重构这个模块"
+
+
+async def test_user_wrap_edit_restamp_and_delete_keeps_stamp():
+    """调用方改写某轮文本 → 该轮重新盖戳;删除中间轮 → 其余轮戳值不变
+    (键 = sha256(text),与索引无关)。"""
+    p1, _ = await wrap_cli_request(_session_a_turn1(), MODEL, "proj")
+    stamp1 = p1["request"]["contents"][0]["parts"][0]["text"]
+
+    # turn3 历史含同一首轮文本 → 逐字节稳定(回归 0080 口径)
+    p3a, _ = await wrap_cli_request(_session_a_turn3(), MODEL, "proj")
+    p3b, _ = await wrap_cli_request(_session_a_turn3(), MODEL, "proj")
+    assert p3a["request"]["contents"][0]["parts"][0]["text"] == stamp1
+    assert (
+        p3b["request"]["contents"][0]["parts"][0]["text"] == stamp1
+    ), "同轨迹同文本跨请求戳值必须恒定"

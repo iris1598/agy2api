@@ -172,9 +172,10 @@ _MAX_TRACKED_TRAJECTORIES = 2048
 
 
 def _reset_trajectory_request_seq() -> None:
-    """清空轨迹计数器(仅供测试;覆盖 request_seq 与 step 重发状态)。"""
+    """清空轨迹计数器(仅供测试;覆盖 request_seq、step 重发状态与 user 轮盖戳)。"""
     with _TRAJECTORY_COUNTERS_LOCK:
         _TRAJECTORY_COUNTERS.clear()
+    _reset_user_turn_time_registry()
 
 
 def _reset_trajectory_step_state() -> None:
@@ -318,6 +319,102 @@ def _resolve_last_execution_id(contents: Any, trajectory_id: str) -> str:
         trajectory_id.encode("utf-8") + b"|last_execution|" + canonical.encode("utf-8")
     ).digest()
     return str(uuid.UUID(bytes=digest[:16], version=4))
+
+
+# ==================== user 轮 <USER_REQUEST> 包装 ====================
+# 实抓结论(163547/193455 全部 60 条 agent 请求,无例外):
+# - 真实客户端发出的每一条 user 轮文本都带包装(包括历史中的旧轮):
+#     <USER_REQUEST>\n{原文}\n</USER_REQUEST>\n
+#     <ADDITIONAL_METADATA>\nThe current local time is: {本地时间}.\n</ADDITIONAL_METADATA>
+#   首轮另带 <USER_SETTINGS_CHANGE>——那是 UI 改设置事件(两次实抓分别是
+#   "Model Selection" 档位变更),代理没有对应事件,按"不伪造"原则永不注入。
+# - 包装在该轮**首次发送时**定格,此后历史中逐字节回放:0080 的 contents[0]
+#   时间仍是首轮 0013 的 16:40:48,contents[50] 是 0074 的 16:52:43;
+#   0013 失败后 0014 原样重发,时间不变。
+# - checkpoint / agent_monitoring 请求带裸文本(代理不发送这两类)。
+# 代理侧:contents 每次由调用方请求现场转换,无法记住每轮的原始发送时刻,
+# 用轨迹级"首次见到即盖戳"进程内注册表复现稳定性语义(与 step 重发偏移同一
+# 失败模式:重启丢失后重新盖戳,时间跳变一次但立即重新稳定)。时间本身是
+# 客户端本地状态,上游从不回显校验。
+
+_USER_TURN_TIMES: "OrderedDict[str, OrderedDict[str, str]]" = OrderedDict()
+_USER_TURN_TIMES_LOCK = threading.Lock()
+_MAX_TRACKED_USER_TURN_TRAJECTORIES = 512
+_MAX_USER_TURNS_PER_TRAJECTORY = 256
+
+
+def _wrap_user_turn_text(text: str, when_iso: str) -> str:
+    """按实抓格式包装一条 user 文本(163547/0013、0074 逐字节对照)。
+
+    已是包装形态(实抓重放/调用方自带/重复调用)则原样返回,保证幂等。
+    """
+    if text.lstrip().startswith("<USER_REQUEST>"):
+        return text
+    return (
+        f"<USER_REQUEST>\n{text}\n</USER_REQUEST>\n"
+        f"<ADDITIONAL_METADATA>\n"
+        f"The current local time is: {when_iso}.\n"
+        f"</ADDITIONAL_METADATA>"
+    )
+
+
+def _reset_user_turn_time_registry() -> None:
+    """清空 user 轮盖戳注册表(仅供测试)。"""
+    with _USER_TURN_TIMES_LOCK:
+        _USER_TURN_TIMES.clear()
+
+
+def _resolve_user_turn_time(trajectory_id: str, text: str) -> str:
+    """同一 (trajectory, user 文本) 的包装时间戳:首次见到即定格(ISO8601 本地时区)。
+
+    键 = sha256(text):调用方删改历史轮导致索引平移时不破坏既有轮的戳值
+    (0080 证据:各轮保留各自首次发送时间);相同文本(极罕见)共享同值,无观察差异。
+    """
+    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    with _USER_TURN_TIMES_LOCK:
+        turns = _USER_TURN_TIMES.get(trajectory_id)
+        if turns is None:
+            turns = OrderedDict()
+            _USER_TURN_TIMES[trajectory_id] = turns
+        _USER_TURN_TIMES.move_to_end(trajectory_id)
+        stamp = turns.get(key)
+        if stamp is None:
+            stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            turns[key] = stamp
+            while len(turns) > _MAX_USER_TURNS_PER_TRAJECTORY:
+                turns.popitem(last=False)
+        while len(_USER_TURN_TIMES) > _MAX_TRACKED_USER_TURN_TRAJECTORIES:
+            _USER_TURN_TIMES.popitem(last=False)
+        return stamp
+
+
+def _wrap_user_turns(contents: Any, trajectory_id: str, *, skip: bool = False) -> None:
+    """对 contents 中全部 role=user 的 text part 做实抓形态包装(原地)。
+
+    - 仅 agent 路径;图片生成模型无实抓证据,``skip=True`` 整体跳过;
+    - 空文本不包装;已是包装形态的文本幂等跳过(实抓重放/调用方自带);
+    - 多文本 part 无实抓证据,按 part 各自独立包装是保守外推,常规单文本
+      part 路径与实抓逐字节一致。
+    """
+    if skip or not isinstance(contents, list):
+        return
+    for content in contents:
+        if not isinstance(content, dict) or content.get("role") != "user":
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if text.lstrip().startswith("<USER_REQUEST>"):
+                continue
+            part["text"] = _wrap_user_turn_text(
+                text, _resolve_user_turn_time(trajectory_id, text)
+            )
 
 
 def _build_labels(
@@ -509,6 +606,13 @@ async def build_envelope_parts(
 
     step = _resolve_trajectory_step(trajectory_id, natural_step)
 
+    # user 轮 <USER_REQUEST> 包装(§10.13 实抓:60 条 agent 请求无例外)。
+    # 位置在锚点派生(取 raw,保持锚点与包装解耦)与 step 计数(按角色计数,
+    # 不受文本影响)之后;last_execution_id 只哈希 fr 轮(role=model),同样
+    # 不受影响。图片生成模型无实抓证据,跳过。
+    is_image_request = "image" in (model or "").lower()
+    _wrap_user_turns(inner.get("contents"), trajectory_id, skip=is_image_request)
+
     # thoughtSignature 回注：真实客户端会把上一轮签名带回；兼容客户端常丢弃。
     # 只补回本轨迹确实见过的签名，不伪造。
     thought_signature_cache.replay_into_contents(inner.get("contents"), trajectory_id)
@@ -546,12 +650,10 @@ async def build_envelope_parts(
         "lastExecutionId": labels.get("last_execution_id", ""),
     }
 
-    # requestType 与 toolConfig 对齐官方 agent 状态机：
-    # - 常规智能体交互（有 tools 或含工具调用上下文）→ agent；
-    # - 纯文本问答 / 补全 → chat，且绝不携带 tools/toolConfig（避免 Agent 资源池限流）。
+    # toolConfig 对齐官方 agent 状态机：requestType 已由下方出口统一判定
+    # （非图片一律 agent，§10.11），这里只处理 tools/toolConfig 的透传与剥离。
     tools = inner.get("tools")
     has_tools = _has_function_tool(tools)
-    is_image_request = "image" in (model or "").lower()
 
     if not is_image_request:
         # toolConfig 纯透传：客户端有就传，没有就不传（对齐官方 Antigravity 报文，
