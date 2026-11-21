@@ -1,0 +1,64 @@
+name: fidelity
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  # 原生平台跑 pytest + 指纹闭环校验（覆盖"按 CPU 调整密码套件顺序"这类平台差异）
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest pytest-asyncio
+
+      - name: Build Go TLS forwarder
+        shell: bash
+        run: |
+          cd tools/upstream_tls_proxy
+          mkdir -p bin
+          if [ "$RUNNER_OS" = "Windows" ]; then out=bin/upstream-proxy.exe; else out=bin/upstream-proxy; fi
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$out" .
+        env:
+          CGO_ENABLED: "0"
+
+      - name: pytest
+        run: python -m pytest -q
+
+      - name: Fidelity self-check (JA3 + header + envelope schema)
+        run: python tools/antigravity_capture/sniff_cli.py verify --envelope --json
+
+  # 发布目标全部编译通过（armv7 / musl 等不做指纹实测，仅保证可构建）
+  build-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+
+      - name: Cross-compile all targets
+        run: bash tools/upstream_tls_proxy/build-all.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: upstream-proxy-binaries
+          path: tools/upstream_tls_proxy/bin/upstream-proxy-*

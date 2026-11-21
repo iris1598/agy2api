@@ -207,6 +207,17 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 - `ANTIGRAVITY_API_URL`: Antigravity API 端点
 - `PATH_PREFIX`: 反代保留路径前缀（如 `/AGY2API`）时配置，由后端在路由匹配前剥掉该前缀；默认：空（不剥离）
 
+**出站 TLS 指纹（Go 转发器）**
+- `UPSTREAM_TLS_IMPERSONATION`: 启用 Go 出站 TLS 转发器（默认：true）。开启后发往 Antigravity API 的请求经本机 Go 转发器出站，ClientHello（JA3/密码套件/扩展/PQ 曲线组/ALPN）与真实客户端逐段一致；二进制缺失或启动失败时自动回退 httpx。
+- `UPSTREAM_TLS_PROXY_URL`: 转发器监听地址（默认：`http://127.0.0.1:17890`）
+- `UPSTREAM_TLS_PROXY_BIN`: 手动指定转发器二进制路径（默认自动查找 `tools/upstream_tls_proxy/bin/`）
+
+> 源码运行需自行编译一次转发器（需要 Go ≥ 1.26）：`powershell -ExecutionPolicy Bypass -File .\tools\upstream_tls_proxy\build.ps1`（Linux/macOS 用 `bash tools/upstream_tls_proxy/build.sh`）。Docker 镜像已内置编译阶段。
+
+**保真度与防封**
+- `STRICT_FIDELITY`: 严格模式（默认：true）。模型枚举缺失、客户端携带真实客户端不会发的字段、参数与模型档位冲突、Go 出站核心不可用等情况**直接返回错误**，不发上游请求、不静默降级；启动时也会自检，不可用则拒绝启动。
+- `CREDENTIAL_MAX_CONCURRENT`: 单凭证在途请求上限（默认：2，0 表示不限），超出在本地排队而不是换号。
+
 **性能和稳定性配置**
 - `RETRY_429_ENABLED`: 启用错误自动重试（默认：true）
 - `RETRY_429_MAX_RETRIES`: 最大重试次数（默认：5）

@@ -79,6 +79,7 @@ venv.bak/
 .vscode/
 .idea/
 .claude/
+.zcode/
 *.swp
 *.swo
 *~
@@ -101,6 +102,13 @@ log.txt
 *.temp
 *.bak
 
-tools/
+# 保真度基准（由 sniff_cli.py schema 生成，不含账号数据）需要入库
+!fidelity_schema.json
+
+# tools/ 下源码需要提交（Dockerfile 构建依赖 tools/upstream_tls_proxy）；
+# 抓包数据与编译产物只保留在本地。
+tools/antigravity_capture/captures/
+tools/antigravity_capture/logs/
+tools/upstream_tls_proxy/bin/
 aicode/
 streamchat/
