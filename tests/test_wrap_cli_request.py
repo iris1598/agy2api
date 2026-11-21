@@ -2,8 +2,9 @@
 
 覆盖:
 - 同一会话跨轮次 → sessionId / trajectory_id / labels 恒定（仅 requestId 时间戳段变化）
-- 共用 systemInstruction 的不同会话 → sessionId 隔离
-- 不同模型 → sessionId 隔离
+- sessionId 装机级稳定（实抓 163547/193455：跨会话/跨模型恒定，按凭证派生隔离）
+- 共用 systemInstruction 的不同会话 → trajectory/cascade 隔离
+- 不同模型 → trajectory/cascade 隔离
 - step 随模型轮数递增，同步写入 requestId 末段与 labels
 - 客户端显式 sessionId 透传
 - labels 键序与 requestType 判定不受影响
@@ -195,9 +196,11 @@ async def test_step_excludes_function_response_rounds():
 
 
 async def test_shared_system_sessions_isolated():
+    """sessionId 装机级恒定（实抓 163547/193455 跨会话同值）；不同会话靠
+    trajectory/cascade 隔离。"""
     pa, _ = await wrap_cli_request(_session_a_turn1(), MODEL, "proj")
     pb, _ = await wrap_cli_request(_session_b(), MODEL, "proj")
-    assert pa["request"]["sessionId"] != pb["request"]["sessionId"]
+    assert pa["request"]["sessionId"] == pb["request"]["sessionId"]
     assert pa["request"]["labels"]["trajectory_id"] != pb["request"]["labels"]["trajectory_id"]
 
 
@@ -275,9 +278,28 @@ async def test_last_execution_id_stable_within_cycle_then_refreshes():
 
 
 async def test_different_model_isolated():
+    """不同模型：sessionId 装机级恒定，trajectory/cascade 隔离（锚点含模型名）。"""
     pa, _ = await wrap_cli_request(_session_a_turn1(), MODEL, "proj")
     pb, _ = await wrap_cli_request(_session_a_turn1(), "claude-sonnet-5-5-medium", "proj")
-    assert pa["request"]["sessionId"] != pb["request"]["sessionId"]
+    assert pa["request"]["sessionId"] == pb["request"]["sessionId"]
+    assert pa["request"]["labels"]["trajectory_id"] != pb["request"]["labels"]["trajectory_id"]
+
+
+def test_install_session_id_stable_and_salt_isolated():
+    """sessionId 按凭证派生：跨对话/跨模型恒定，换账号盐即换值（多账号隔离）。"""
+    ids_a = _derive_upstream_session_ids(_session_a_turn1(), MODEL, "cred-1")
+    ids_b = _derive_upstream_session_ids(_session_b(), MODEL, "cred-1")
+    ids_c = _derive_upstream_session_ids(
+        _session_a_turn1(), "claude-sonnet-5-5-medium", "cred-1"
+    )
+    ids_other = _derive_upstream_session_ids(_session_a_turn1(), MODEL, "cred-2")
+    assert ids_a.session_id == ids_b.session_id == ids_c.session_id
+    assert ids_a.session_id != ids_other.session_id
+    # 无账号盐退化为全局常量形态
+    ids_no_salt = _derive_upstream_session_ids(_session_a_turn1(), MODEL, "")
+    assert ids_no_salt.session_id.startswith("-")
+    uuid.UUID(ids_a.trajectory_id)
+    uuid.UUID(ids_a.cascade_id)
 
 
 async def test_client_session_id_passthrough():
@@ -295,7 +317,7 @@ async def test_empty_contents_fallback_session_id():
 
 
 async def test_labels_and_request_type_unchanged():
-    """labels 键序（官方字母序）与 requestType 判定保持既有行为。"""
+    """labels 键序（官方字母序）与 requestType 判定保持实抓行为。"""
     p, _ = await wrap_cli_request(_session_a_turn1(), MODEL, "proj")
     labels = p["request"]["labels"]
     assert list(labels.keys()) == [
@@ -320,8 +342,9 @@ async def test_labels_and_request_type_unchanged():
     assert "last_execution_id" not in labels
     assert labels["used_claude"] == "false"
     assert labels["used_non_gemini_model"] == "false"
-    # 无 tools 且无工具交互 → chat
-    assert p["requestType"] == "chat"
+    # 无 tools 的纯文本请求也是 agent(实抓 193455:纯文本问候同样 agent+16 工具
+    # 声明,chat 在实抓中 0 次出现)
+    assert p["requestType"] == "agent"
 
     # 带 tools → agent，且 used_claude 正确
     req = _session_a_turn1()
@@ -351,10 +374,11 @@ def test_derive_upstream_session_ids_deterministic():
     uuid.UUID(ids1.cascade_id)
     # cascade 与 trajectory 不同源，取值必须不同
     assert ids1.cascade_id != ids1.trajectory_id
-    # 与 derive_session_key 联合锚点同源：摘要前缀即 sessionId int
+    # sessionId 装机级稳定（实抓 163547/193455 跨会话同值），不再取自对话锚点摘要；
+    # trajectory/cascade 仍与 derive_session_key 联合锚点同源（无账号盐时摘要原样）
     from src.session_cache import derive_conversation_anchor
     digest = derive_conversation_anchor(MODEL, _session_a_turn1())
-    assert int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF == int(ids1.session_id[1:])
+    assert str(uuid.UUID(bytes=digest[8:24])) == ids1.trajectory_id
 
 
 def test_generate_request_id_format():
@@ -425,7 +449,7 @@ class TestEnvelopePartsAndSidecar:
     async def test_parts_shape_and_labels_placeholder(self):
         parts = await build_envelope_parts(_session_a_turn3(), MODEL, "proj")
         keys = [key for key, _value in parts.inner_entries]
-        # chat(无 tools)内层键序:contents → systemInstruction → labels → sessionId
+        # 无 tools 纯文本请求(实抓同形态)内层键序:contents → systemInstruction → labels → sessionId
         assert keys == ["contents", "systemInstruction", "labels", "sessionId"]
         # labels 位是 None 占位(字节由 Go 产出)
         assert dict(parts.inner_entries)["labels"] is None
@@ -433,7 +457,8 @@ class TestEnvelopePartsAndSidecar:
         assert parts.anchors["lastStepIndex"] == "4"
         assert parts.anchors["requestIdLabel"] == f"{parts.trajectory_id}-0"
         assert parts.anchors["cascadeId"] == parts.anchors["rootCascadeId"]
-        assert parts.request_type == "chat"
+        # 纯文本请求也是 agent(实抓 193455;chat 0 次出现)
+        assert parts.request_type == "agent"
 
     async def test_compose_python_envelope_matches_wrap(self):
         """参照作曲与 wrap_cli_request 完全等价(同一序列计数下)。"""

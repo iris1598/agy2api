@@ -77,32 +77,47 @@ class UpstreamSessionIds(NamedTuple):
     cascade_id: str
 
 
+def _derive_install_session_id(account_salt: str = "") -> str:
+    """装机级稳定 sessionId（实抓 163547/193455：两个不同会话（不同 cascade/
+    trajectory）的 sessionId 同为 ``-3750763034362895579``——真实客户端的
+    sessionId 不随对话变化，一个安装一个值，非逐对话派生）。
+
+    代理侧按凭证派生：一个凭证 = 一个客户端安装，跨会话/跨重启恒定；
+    无账号盐时退化为全局常量（单凭证部署等效）。仍保持 -{int} 形态。
+    """
+    digest = hashlib.sha256(
+        b"upstream-session:" + (account_salt or "").encode("utf-8")
+    ).digest()
+    session_int = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+    return f"-{session_int}"
+
+
 def _derive_upstream_session_ids(
     gemini_request: Dict[str, Any], model: str, account_salt: str = ""
 ) -> UpstreamSessionIds:
     """
-    从联合锚点摘要确定性派生上游 (sessionId, trajectory_id, cascade_id)。
+    确定性派生上游 (sessionId, trajectory_id, cascade_id)。
 
-    联合锚点 = SHA256(model + systemInstruction 文本 + 前两条消息特征)，
-    与 derive_session_key 同口径，保证:
-    - 同一会话跨轮次/跨请求三者恒定（KV 缓存路由亲和）；
-    - 共用相同 systemInstruction 的不同会话（多 Agent / 主子会话）不会撞车；
-    - 摘要前 8 字节 → sessionId（沿用既有 -{int} 形态）；
-    - 摘要 8~24 字节 → 16 字节确定性 UUID 形态 trajectory_id；
-    - ``sha256("cascade:" + 摘要)[:16]`` → cascade_id（实测 cascade_id 与
-      root_cascade_id 同值，且等于 requestId 第 2 段；与 trajectory_id 不同源）。
+    - sessionId：装机级稳定（`_derive_install_session_id`，实抓证实真实客户端
+      跨会话恒定），按凭证派生隔离多账号；
+    - trajectory_id / cascade_id：逐对话派生——联合锚点 =
+      SHA256(model + systemInstruction 文本 + 前两条消息特征)，与
+      derive_session_key 同口径，保证同一会话跨轮次恒定（KV 缓存路由亲和）、
+      共用相同 systemInstruction 的不同会话不撞车：
+      - 摘要（混入账号盐后）8~24 字节 → 16 字节确定性 UUID 形态 trajectory_id；
+      - ``sha256("cascade:" + 摘要)[:16]`` → cascade_id（实测 cascade_id 与
+        root_cascade_id 同值，且等于 requestId 第 2 段；与 trajectory_id 不同源）。
 
-    无锚点（如空对话）时返回全空，由调用方兜底。
+    无锚点（如空对话）时 trajectory/cascade 为空，由调用方兜底；sessionId 恒有值。
     """
+    session_id = _derive_install_session_id(account_salt)
     digest = derive_conversation_anchor(model, gemini_request)
     if digest is None:
-        return UpstreamSessionIds("", "", "")
+        return UpstreamSessionIds(session_id, "", "")
     if account_salt:
-        # 账号盐：避免不同凭证对同一段内容派生出相同的 session/trajectory，
+        # 账号盐混入摘要：避免不同凭证对同一段内容派生出相同的 trajectory，
         # 否则上游会看到"两个账号在跑同一条轨迹"这种强关联信号。
         digest = hashlib.sha256(account_salt.encode("utf-8") + b"|" + digest).digest()
-    session_int = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
-    session_id = f"-{session_int}"
     trajectory_id = str(uuid.UUID(bytes=digest[8:24]))
     cascade_id = str(uuid.UUID(bytes=hashlib.sha256(b"cascade:" + digest).digest()[:16]))
     return UpstreamSessionIds(session_id, trajectory_id, cascade_id)
@@ -366,27 +381,6 @@ def _has_function_tool(tools: Any) -> bool:
     return False
 
 
-def _contents_have_tool_interactions(contents: Any) -> bool:
-    """判断 contents 历史中是否存在工具调用上下文。"""
-    if not isinstance(contents, list):
-        return False
-    for content in contents:
-        if not isinstance(content, dict):
-            continue
-        parts = content.get("parts")
-        if not isinstance(parts, list):
-            continue
-        for part in parts:
-            if isinstance(part, dict) and (
-                "functionCall" in part
-                or "function_call" in part
-                or "functionResponse" in part
-                or "function_response" in part
-            ):
-                return True
-    return False
-
-
 def _should_forward_antigravity_header(header_name: str) -> bool:
     """判断是否向 Antigravity 上游透传该请求头。
 
@@ -553,11 +547,9 @@ async def build_envelope_parts(
     # - 纯文本问答 / 补全 → chat，且绝不携带 tools/toolConfig（避免 Agent 资源池限流）。
     tools = inner.get("tools")
     has_tools = _has_function_tool(tools)
-    has_tool_interactions = _contents_have_tool_interactions(inner.get("contents"))
-    is_agent_request = has_tools or has_tool_interactions
     is_image_request = "image" in (model or "").lower()
 
-    if is_agent_request and not is_image_request:
+    if not is_image_request:
         # toolConfig 纯透传：客户端有就传，没有就不传（对齐官方 Antigravity 报文，
         # 绝不主动注入任何默认 mode），连同 allowedFunctionNames 等字段完整保留。
         # tools 兜底拆分为官方单函数独立切片形态（上游 normalize 已拆，此为最终出口保证）
@@ -569,7 +561,7 @@ async def build_envelope_parts(
         if not has_tools:
             inner.pop("toolConfig", None)
     else:
-        # 无工具交互 / 图片生成：剥离客户端可能携带的 tools/toolConfig，对齐官方 chat 报文
+        # 图片生成走独立路径：剥离 tools/toolConfig
         inner.pop("tools", None)
         inner.pop("toolConfig", None)
 
@@ -588,7 +580,10 @@ async def build_envelope_parts(
         labels=labels,
         anchors=anchors,
         model=model,
-        request_type="image_gen" if is_image_request else ("agent" if is_agent_request else "chat"),
+        # requestType 实抓对齐(163547/193455):真实客户端的对话请求一律 agent
+        # (纯文本问候也带 16 个工具声明),chat 在实抓中 0 次出现,不再产出;
+        # 图片生成走独立 image_gen 形态
+        request_type="image_gen" if is_image_request else "agent",
         project_id=project_id,
         trajectory_id=trajectory_id,
         cascade_id=cascade_id,

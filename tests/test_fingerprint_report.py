@@ -61,7 +61,7 @@ def compose_python_envelope(parts):
         "request": inner,
         "model": model,
         "userAgent": "antigravity",
-        "requestType": "image_gen" if is_image_request else ("agent" if is_agent_request else "chat"),
+        "requestType": "image_gen" if is_image_request else "agent",
     }
     return payload, request_id
 

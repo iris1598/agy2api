@@ -232,7 +232,8 @@ class TestMaxOutputTokensValidation:
 class TestNonStrictClamp:
     """非严格模式下转换器对超限显式值做钳制；严格模式保留原值交给 fidelity 拒绝。"""
 
-    async def _normalize(self, monkeypatch, strict: bool) -> dict:
+    async def _normalize(self, monkeypatch, strict: bool, model: str = "gemini-2.5-flash",
+                         generation_config: dict | None = None) -> dict:
         from src.converter import antigravity_fix
         from src.model_enum import clear_learned_enums
 
@@ -242,9 +243,8 @@ class TestNonStrictClamp:
         monkeypatch.setattr(antigravity_fix, "get_strict_fidelity_enabled", _flag)
         clear_learned_enums()
         profile = SimpleNamespace(family="gemini")
-        generation_config = {"maxOutputTokens": 999999}
         result = await antigravity_fix._normalize_generation_config(
-            {}, generation_config, profile, "gemini-2.5-flash"
+            {}, generation_config or {"maxOutputTokens": 999999}, profile, model
         )
         clear_learned_enums()
         return result
@@ -256,6 +256,36 @@ class TestNonStrictClamp:
     async def test_keeps_value_when_strict(self, monkeypatch):
         result = await self._normalize(monkeypatch, strict=True)
         assert result["maxOutputTokens"] == 999999
+
+
+class TestMaxOutputTokensDefaults:
+    """官方标配 maxOutputTokens 默认注入:hydrogen 系 262144(实抓 163547/193455),
+    其余 Gemini 家族 65536,Claude 64000。"""
+
+    async def _default_for(self, monkeypatch, model: str) -> int:
+        from src.converter import antigravity_fix
+        from src.model_enum import clear_learned_enums
+
+        async def _flag():
+            return True
+
+        monkeypatch.setattr(antigravity_fix, "get_strict_fidelity_enabled", _flag)
+        clear_learned_enums()
+        profile = SimpleNamespace(family="gemini")
+        result = await antigravity_fix._normalize_generation_config(
+            {}, {}, profile, model
+        )
+        clear_learned_enums()
+        return result["maxOutputTokens"]
+
+    async def test_hydrogen_default_is_262144(self, monkeypatch):
+        assert await self._default_for(monkeypatch, "gemini-4-hydrogen-medium") == 262144
+
+    async def test_hydrogen_xhigh_default_is_262144(self, monkeypatch):
+        assert await self._default_for(monkeypatch, "gemini-4-hydrogen-xhigh") == 262144
+
+    async def test_other_gemini_default_is_65536(self, monkeypatch):
+        assert await self._default_for(monkeypatch, "gemini-2.5-flash") == 65536
 
 
 class TestThoughtSignatureCache:

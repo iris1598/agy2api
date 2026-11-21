@@ -507,3 +507,26 @@ owner 新抓 20261121-193455（新会话只发一句"你好"，extra high 档位
    - **maxOutputTokens**：真实客户端 hydrogen 系（medium 与 xhigh）统一
      262144，代理默认 65536（`GEMINI_MAX_OUTPUT_TOKENS`）——已知偏差，是否
      对齐待 owner 定（上限值只影响生成长度封顶）。
+
+### 10.11 第六轮：三项实拍对齐（owner 指示"123 都对齐"）
+
+基于 §10.10 的实抓证据，三项偏差全部对齐：
+
+1. **requestType：chat 分支删除，非图片一律 `agent`**。实抓（163547/193455）
+   证实真实客户端的对话请求一律 agent（纯文本问候也带 16 个工具声明），
+   `chat` 0 次出现；原"chat 避开 Agent 资源池限流"是防御性假设。顺带效果：
+   无 tools 请求不再剥离 tools/toolConfig（真实客户端永远声明工具集，透传
+   更对齐）。死代码 `_contents_have_tool_interactions` 删除。
+
+2. **sessionId 改为装机级稳定**（实抓：两个不同会话 sessionId 同值）。代理侧
+   按**凭证**派生（`_derive_install_session_id`：sha256("upstream-session:" +
+   account_salt) → -{int}），一个凭证 = 一个客户端安装，跨会话/跨重启恒定；
+   换凭证即换值（多账号隔离保留）。trajectory/cascade 仍逐对话派生（实抓
+   证实跨会话不同）。原"摘要前 8 字节 → sessionId"口径废止。
+
+3. **maxOutputTokens 默认注入：hydrogen 系 262144**（实抓 medium/xhigh 统一
+   262144；注册表上限本就是 262144，严格模式校验兼容）。其余 Gemini 家族
+   65536、Claude 64000 不变。
+
+**pytest 232 passed**（+4：requestType/装机 sessionId/hydrogen 默认值各一组）；
+`verify --envelope --json` 全绿。本地领先 origin 3 个提交（d94af71/ec55092/本轮）。

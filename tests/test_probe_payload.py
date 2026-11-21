@@ -75,10 +75,11 @@ def test_project_and_model_passthrough() -> None:
     assert payload["userAgent"] == "antigravity"
 
 
-def test_no_tools_request_type_is_chat() -> None:
-    """无工具交互应判定为 chat（纯文本问答）"""
+def test_no_tools_request_type_is_agent() -> None:
+    """无工具的纯文本请求也是 agent（实抓 193455：问候语同样 agent+16 工具
+    声明，chat 在实抓中 0 次出现）"""
     payload = _build()
-    assert payload["requestType"] == "chat"
+    assert payload["requestType"] == "agent"
 
 
 def test_request_has_session_id_and_labels() -> None:
