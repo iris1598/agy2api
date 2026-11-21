@@ -306,6 +306,19 @@
       "request_types": [
         "agent_monitoring"
       ]
+    },
+    "gemini-4-hydrogen-xhigh": {
+      "model_enum": "MODEL_PLACEHOLDER_M528",
+      "generation_config": {
+        "maxOutputTokens": 262144,
+        "thinkingConfig": {
+          "includeThoughts": true,
+          "thinkingLevel": 100
+        }
+      },
+      "request_types": [
+        "agent"
+      ]
     }
   }
 }

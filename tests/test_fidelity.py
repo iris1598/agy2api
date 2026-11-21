@@ -165,6 +165,46 @@ class TestValidateClientRequest:
         assert exc_info.value.reason == "generation_config_mismatch"
 
 
+class TestXhighThinkingLevel:
+    """xhigh（extra high）档位：实抓 193455/0012 证实为数值 100（非字符串），
+    model_enum M528、maxOutputTokens 262144。"""
+
+    def test_injects_numeric_100_for_xhigh(self):
+        from src.model_enum import merge_model_enums
+
+        merge_model_enums({"gemini-4-hydrogen-xhigh": "MODEL_PLACEHOLDER_M528"})
+        request = {"contents": []}
+        validate_client_request(request, "gemini-4-hydrogen-xhigh")
+        thinking = request["generationConfig"]["thinkingConfig"]
+        assert thinking["thinkingLevel"] == 100
+        assert isinstance(thinking["thinkingLevel"], int)
+        assert thinking["includeThoughts"] is True
+
+    def test_conflicting_level_rejected_on_xhigh(self):
+        from src.model_enum import merge_model_enums
+
+        merge_model_enums({"gemini-4-hydrogen-xhigh": "MODEL_PLACEHOLDER_M528"})
+        request = {
+            "contents": [],
+            "generationConfig": {"thinkingConfig": {"thinkingLevel": "HIGH"}},
+        }
+        with pytest.raises(FidelityError) as exc_info:
+            validate_client_request(request, "gemini-4-hydrogen-xhigh")
+        assert exc_info.value.reason == "generation_config_mismatch"
+
+    def test_numeric_100_accepted_on_xhigh(self):
+        """客户端照实抓形态给数值 100 → 放行（比较键归一，不再误判冲突）。"""
+        from src.model_enum import merge_model_enums
+
+        merge_model_enums({"gemini-4-hydrogen-xhigh": "MODEL_PLACEHOLDER_M528"})
+        request = {
+            "contents": [],
+            "generationConfig": {"thinkingConfig": {"thinkingLevel": 100}},
+        }
+        validate_client_request(request, "gemini-4-hydrogen-xhigh")
+        assert request["generationConfig"]["thinkingConfig"]["thinkingLevel"] == 100
+
+
 class TestMaxOutputTokensValidation:
     """严格模式 maxOutputTokens 上限校验（只拦有实抓证据的超限显式值）。"""
 

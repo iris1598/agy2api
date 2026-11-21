@@ -53,8 +53,14 @@
 
 ## 4. 剩余事项
 
-- captures/20261121-163547 含提示词:**处理完删除**(已 gitignore,勿提交)。
-- 两个抓包遗留转发器进程已清理;Go 二进制已重建(协议 3)。
+- **requestType "chat" 判定证据已齐**（193455 问候抓包）：纯文本问候 →
+  `agent` + 16 工具声明，`chat` 两次实抓 0 次出现；建议无工具请求改发
+  `agent`，等 owner 拍板（HANDOVER §10.10 第 2 点）。
+- **maxOutputTokens**：真实客户端 hydrogen 系统一 262144，代理默认 65536，
+  是否对齐待 owner 定。
+- captures/20261121-163547（黄金样本依赖，本地留存）与 20261121-193455
+  （xhigh 证据）含提示词，已 gitignore 勿提交，用完可删。
 - 既有差距(未修,后续候选):真实客户端 systemInstruction 会随功能激活演化,
-  按其派生 trajectory_id 会断裂上游缓存亲和(见 HANDOVER §10.9 第 6 点)。
+  按其派生 trajectory_id 会断裂上游缓存亲和(见 HANDOVER §10.9 第 6 点);
+  sessionId 真实客户端是装机级稳定值,代理逐对话派生(观察项,见 §10.10 第 3 点)。
 - 全部运行/测试仍用 `.venv\Scripts\python.exe`;导入规范见 `AGENTS.md`。

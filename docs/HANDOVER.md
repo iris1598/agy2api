@@ -478,3 +478,32 @@ nonebot 项目，57 条 streamGenerateContent + 全量响应落盘），并明�
 
 > **遗留操作**：captures/20261121-163547 含提示词，处理完删除（gitignore，
 > 勿提交）；两个抓包遗留转发器进程已清理，Go 二进制已重建为协议 3。
+
+### 10.10 第五轮：问候抓包（193455）——xhigh 闭环 + chat 判定证据
+
+owner 新抓 20261121-193455（新会话只发一句"你好"，extra high 档位）：
+
+1. **xhigh 档位闭环（§10.6 遗留第 4 点）**：`gemini-4-hydrogen-xhigh` 的 agent
+   请求 `thinkingLevel` 是**数值 100**（非字符串！），maxOutputTokens 262144，
+   model_enum M528（枚举表已有）。实现：`fidelity._thinking_level_from_model`
+   xhigh → 100（注入 JSON 数值）；比较键归一（数值 100 放行、字符串/其它值
+   拒绝）；fidelity_schema 登记 xhigh 模型条目。**pytest 228 passed**。
+
+2. **requestType "chat" 判定证据（待 owner 拍板）**：普通对话面板发纯文本问候
+   → `requestType=agent` + 16 工具声明（与 163547/0013 一致）。`chat` 在两次
+   实抓中 0 次出现，真实客户端不存在无工具声明的对话请求。建议：我们的无工具
+   请求也改发 `agent`（实抓为准）；原"chat 避开 Agent 资源池限流"只是防御性
+   假设，无实据。改动几行 + 测试同步，等 owner 确认。
+
+3. **新观察（未修，记录）**：
+   - **sessionId 是装机级稳定值**：163547 与 193455 两个不同会话（不同
+     cascade/trajectory）的 sessionId 同为 `-3750763034362895579`——真实客户端
+     的 sessionId 不随对话变化；代理按内容锚点逐对话派生（路由用途等效，但
+     画像不同，后续若上游校验再议）；
+   - **checkpoint 请求**（0011/0013）：contents 只带原始用户文本（"你好"，非
+     `<USER_REQUEST>` 包装），flash-lite + `thinkingLevel: "LOW"`（字符串）+
+     无 tools/无 labels；0011 曾 503 后重发为 0013。属客户端内部功能，代理
+     不实现；
+   - **maxOutputTokens**：真实客户端 hydrogen 系（medium 与 xhigh）统一
+     262144，代理默认 65536（`GEMINI_MAX_OUTPUT_TOKENS`）——已知偏差，是否
+     对齐待 owner 定（上限值只影响生成长度封顶）。

@@ -61,28 +61,45 @@ class FidelityError(Exception):
 _PROXY_DEFAULT_MAX_OUTPUT = (65536, 64000)
 
 
-def _thinking_level_from_model(model: str) -> str:
+def _thinking_level_from_model(model: str):
+    """按模型名解析官方 thinkingLevel 字面值（返回值即注入的 JSON 值）。
+
+    实抓（163547/193455 真实转发会话）：
+    - ``gemini-4-*-low|medium|high`` → 字符串 ``"LOW"/"MEDIUM"/"HIGH"``；
+    - ``gemini-4-hydrogen-xhigh``（extra high 档位）→ **数值 ``100``**，
+      不是字符串（193455/0012：``"thinkingLevel": 100``，maxOutputTokens
+      262144，model_enum M528）；
+    - MINIMAL/"LOW"（flash-lite）只出现在 agent_monitoring/checkpoint 心跳
+      请求上，agent 聊天路径 0 条；本代理只发 agent 请求，不应注入/接受。
+    返回 None 表示该模型无实抓档位证据，不校验不注入。
+    """
     lowered = (model or "").lower()
-    # 用户可见模型的档位集合是 low/medium/high（部分系列有 extra high，见 xhigh 后缀），
-    # 档位随模型变化（owner 2026-11-21 确认）。
-    # MINIMAL 不纳入：实抓中它只出现在 agent_monitoring 辅助请求 + flash-lite 内部模型上，
-    # agent 聊天路径 0 条；本代理只发 agent 请求，不应注入/接受 MINIMAL。
-    # xhigh 后缀模型暂不参与校验：owner 确认该档位存在，但实抓未覆盖 xhigh 模型请求，
-    # 上游报文里的真实档位字符串未证实——按"无证据不注入"原则等抓包补证。
+    if lowered.endswith("-xhigh"):
+        return 100
     for suffix in ("low", "medium", "high"):
         if lowered.endswith("-" + suffix):
             return suffix.upper()
-    return ""
+    return None
+
+
+def _thinking_level_key(value) -> str:
+    """thinkingLevel 的比较键：字符串档位大小写归一，数值档位取十进制文本。"""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return str(int(value))
+    return str(value or "").upper()
 
 
 def _validate_generation_config(request: Dict[str, Any], model: str) -> None:
     """校验/补齐 thinkingConfig，使其与模型档位一致。
 
-    实抓样本里 thinkingLevel 与 ``gemini-4-*-(low|medium|high)`` 后缀一一对应，
-    且始终带 includeThoughts。客户端给出冲突值即拒绝。
+    实抓样本里 thinkingLevel 与 ``gemini-4-*-(low|medium|high)`` 后缀对应
+    （字符串），xhigh 档位为数值 100；始终带 includeThoughts。客户端给出
+    冲突值即拒绝。
     """
     wanted = _thinking_level_from_model(model)
-    if not wanted:
+    if wanted is None:
         return
 
     config = request.get("generationConfig")
@@ -102,8 +119,11 @@ def _validate_generation_config(request: Dict[str, Any], model: str) -> None:
         }
     else:
         thinking = dict(thinking)
-        existing = str(thinking.get("thinkingLevel") or "").upper()
-        if existing and existing != wanted:
+        existing = thinking.get("thinkingLevel")
+        if (
+            existing is not None
+            and _thinking_level_key(existing) != _thinking_level_key(wanted)
+        ):
             raise FidelityError(
                 "generation_config_mismatch",
                 f"模型 {model} 要求 thinkingLevel={wanted}，客户端给出 {existing}",
