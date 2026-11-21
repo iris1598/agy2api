@@ -646,6 +646,13 @@ labels/step/header/TLS，从未校验 user 文本形态），发现并修复了�
      `jetski-generative-ui-prompt`、`enable-url-artifacts`），
      上下文字段只有 `IsAutonomous`、skills 注入（`Data.Skills`）与
      cascade 配置——§10.9.6 的 sys 演化维度就此完全枚举。
+   - **OAuth 常量逐字节验证**：`src/utils.py` 的
+     `ANTIGRAVITY_CLIENT_ID`（`1071006060591-tmhssin2h21lcre235vtolojh4g403ep…`）
+     与 `ANTIGRAVITY_CLIENT_SECRET` 均在 LS 二进制中命中（后者 1 次）；
+     二进制里另有两个 Client ID（`884354919052-*`、`1098991175725-*`，
+     推测对应 VS Code 扩展 / CLI 客户端，代理无关）。
+   - **`image_gen` requestType 有静态证据**：字符串存在于 LS 二进制
+     （与 cascadeId 等请求字段同区）；图片路径无实抓报文，维持现状。
 5. **决策记录——"caller 无 tools 时注入真实 16 工具集"评估后不采纳**：
    现已拥有实抓的完整工具声明（163547/0013），注入技术上可行且内容真实，
    但真实客户端的工具集由客户端 agent 循环执行（run_command 等），无工具
