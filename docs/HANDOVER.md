@@ -662,3 +662,44 @@ labels/step/header/TLS，从未校验 user 文本形态），发现并修复了�
 > **遗留**：`docs/HANDOVER.md` §3.9"对话包装一律透传，不编造"的表述已被
 > 本轮升级——实抓证据表明真实客户端对 user 轮有确定性格式包装，复现该
 > 格式不是编造；原始 user 文本仍一字不改（只加包装壳 + 客户端本地时间戳）。
+
+### 10.14 第九轮：粘性锚点——修复 trajectory 首轮断裂与 sys 演化断锚（2026-11-21）
+
+§10.9.6 的"已知差距"在本轮升级为**两个实锤 bug 并修复**，新增测试直接暴露：
+
+1. **既有 bug A（首轮断裂，比 §10.9.6 更严重）**：锚点取 `contents[:2]`，
+   首轮请求只有 1 条消息、第二轮起变为 `[首条 user, 首条 model]`——
+   **每个会话的第 1 条请求与后续请求本来就派生出不同的
+   trajectory/cascade/session_key**。后果：上游视角每个对话都在第 2 条
+   请求换了轨迹（缓存亲和断裂）、凭证亲和在第 2 条请求重新选号、
+   step/request_seq 计数器在第 2 条请求归零（`request_id` 后缀重新从
+   `-0` 开始——与真实客户端"一个 trajectory 内从 0 连续计数"直接矛盾）。
+   此前测试 `test_step_increments_with_model_turns` 断言 turn2 后缀 `-0`
+   正是对该 bug 的错误固化，已随修复更新为连续计数。
+2. **既有 bug B（sys 演化断锚，§10.9.6 原文）**：sys 由实验旗标驱动演化
+   （静态逆向：模板 `{{if .ExperimentEnabled}}`；实抓 0013↔0080 段落不同），
+   sys 全文参与锚点 → 同一会话中途换 key，后果同上。
+
+**修复：粘性首见绑定**（`src/session_cache.py`）：
+
+- 新增 `resolve_sticky_anchor(model, request, account_salt)`：粘性键基底 =
+  `SHA256(model + 首条消息特征)`（**不含 sys、只取首条消息**——追加历史
+  与模型回复都不影响它）；**首次见到**时按纯函数全量锚点
+  （`derive_conversation_anchor`，model + sys + 前两条消息）派生并登记，
+  此后沿用首见绑定。进程内 FIFO+TTL（12h / 4096 条），与轨迹计数器同一
+  失败模式（重启丢失 → 按当前 sys 重新绑定一次，此后稳定）。
+- 纯函数 `derive_conversation_anchor` 保持不变（sys 敏感，测试与其它用途）；
+  两个消费方切换到粘性解析：`derive_session_key`（凭证亲和）与
+  `_derive_upstream_session_ids`（trajectory/cascade 派生）。
+- 账号盐混入**粘性键**（不同凭证不共享绑定）；返回摘要仍是未混盐值，
+  盐由调用方按原口径追加——多账号隔离语义不变。
+- **代价（已评估，净收益）**：同 (模型, 首条消息) 但不同 sys 的两个会话会
+  合并到首见绑定（旧行为仅 sys 相同时才撞车）；对比"每个长会话必断锚 +
+  首轮必断裂"，是明确净收益。
+- `_reset_trajectory_request_seq`（测试复位）现同时清空 user 轮盖戳与
+  粘性锚点绑定。
+
+**测试**：新增 4 个（粘性键跨 sys 演化恒定 / 不同首条消息仍隔离 / 纯函数
+保持 sys 敏感 / wrap 层 sys 演化下 trajectory+step+盖戳全连续）；更新 2 个
+固化旧行为的断言（request_seq 连续计数、首轮即恒定 docstring）。
+**pytest 241 passed**；`verify --envelope --json` 全绿。

@@ -83,7 +83,8 @@ def _session_b():
 
 
 async def test_session_id_and_trajectory_stable_across_turns():
-    """从第二条消息出现起（第 2 轮及以后），sessionId / trajectory_id 恒定。"""
+    """从**首条请求**起 sessionId / trajectory_id 恒定（§10.14 粘性绑定：
+    修复前首轮与后续因锚点取前两条消息而派生不同 trajectory）。"""
     p2a, rid2a = await wrap_cli_request(_session_a_turn3(), MODEL, "proj")
     p2b, rid2b = await wrap_cli_request(_session_a_turn3(), MODEL, "proj")
 
@@ -115,15 +116,17 @@ async def test_step_increments_with_model_turns():
     # turn1: [user] → 自然步号 1；last_step_index = 0
     assert rid1.split("/")[4] == "1"
     assert p1["request"]["labels"]["last_step_index"] == "0"
-    # 实抓 labels.request_id 后缀从 0 开始
-    assert p1["request"]["labels"]["request_id"] == f"{p1['request']['labels']['trajectory_id']}-0"
+    # 实抓 labels.request_id 后缀从 0 开始;粘性绑定后 turn1 与后续共享同一
+    # trajectory(修复前每会话首轮与后续派生不同 trajectory,request_seq 归零)
+    traj = p1["request"]["labels"]["trajectory_id"]
+    assert p1["request"]["labels"]["request_id"] == f"{traj}-0"
 
     # turn3: [user×3, model×2(文本)] → 自然步号 = 3 user + 2 model 轮 = 5
-    traj = p2["request"]["labels"]["trajectory_id"]
+    assert p2["request"]["labels"]["trajectory_id"] == traj
     assert rid2.split("/")[4] == "5"
     assert p2["request"]["labels"]["last_step_index"] == "4"
-    assert p2["request"]["labels"]["request_id"] == f"{traj}-0"
-    assert p3["request"]["labels"]["request_id"] == f"{traj}-1"
+    assert p2["request"]["labels"]["request_id"] == f"{traj}-1"
+    assert p3["request"]["labels"]["request_id"] == f"{traj}-2"
     # p3 与 p2 contents 完全相同 → 实抓语义下是一次客户端重发
     # (163547:0013 502 失败后 0014 原样重发,step +1)→ step 6
     assert rid3.split("/")[4] == "6"
@@ -588,3 +591,21 @@ async def test_user_wrap_edit_restamp_and_delete_keeps_stamp():
     assert (
         p3b["request"]["contents"][0]["parts"][0]["text"] == stamp1
     ), "同轨迹同文本跨请求戳值必须恒定"
+
+
+async def test_sys_evolution_keeps_trajectory_continuous():
+    """§10.9.6 修复回归:sys 会话内演化(0013↔0080 段落差异)不得换 trajectory
+    ——trajectory/step 计数/user 轮盖戳全部连续(真实客户端 trajectory 诞生即
+    定格,真实 sys 由实验旗标驱动演化)。"""
+    p1, rid1 = await wrap_cli_request(_session_a_turn1(), MODEL, "proj")
+    traj1 = p1["request"]["labels"]["trajectory_id"]
+    first_wrapped = p1["request"]["contents"][0]["parts"][0]["text"]
+
+    evolved = _session_a_turn3()
+    evolved["systemInstruction"] = {"parts": [{"text": "You are Antigravity with <artifacts> 段落"}]}
+    p2, rid2 = await wrap_cli_request(evolved, MODEL, "proj")
+    assert p2["request"]["labels"]["trajectory_id"] == traj1, "sys 演化不得换 trajectory"
+    # step 连续(无归零):turn3 自然步号 5,无重发偏移
+    assert rid2.split("/")[4] == "5"
+    # 历史首轮包装文本逐字节保留(盖戳注册表同样按 trajectory 连续)
+    assert p2["request"]["contents"][0]["parts"][0]["text"] == first_wrapped

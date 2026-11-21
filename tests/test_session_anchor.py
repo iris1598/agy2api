@@ -22,10 +22,10 @@ def _req(contents, system=True, model="gemini-4-carbon-medium"):
 
 
 def test_same_session_stable_across_turns():
-    """同一会话追加历史后，从第二条消息出现起 key 必须恒定。
+    """同一会话追加历史后，从首条请求起 key 恒定（§10.14 粘性绑定）。
 
-    锚点取前两条消息：第 1 轮只有一条消息，第 2 轮起前两条固定为
-    [首条 user, 首条 model 回复]（append-only 历史），此后所有轮次恒定。
+    粘性键基底取首条消息（追加历史/模型回复不影响）；绑定的摘要值在
+    首见时按纯函数全量锚点（model + sys + 前两条消息）定格。
     """
     turn2 = _req([
         {"role": "user", "parts": [{"text": "帮我重构这个模块"}]},
@@ -151,3 +151,59 @@ def test_first_two_messages_only():
         {"role": "model", "parts": [{"text": "第 4 条新消息"}]},
     ])
     assert derive_session_key("m", short) == derive_session_key("m", long)
+
+
+# ==================== 粘性锚点(§10.14:sys 会话内演化不断键) ====================
+
+
+@pytest.fixture(autouse=True)
+def _isolated_sticky_memo():
+    from src.session_cache import _reset_sticky_anchor_memo
+
+    _reset_sticky_anchor_memo()
+    yield
+    _reset_sticky_anchor_memo()
+
+
+def test_sticky_key_survives_system_evolution():
+    """systemInstruction 会话内演化(实验旗标/功能激活)→ key 不变(§10.9.6 修复)。
+
+    纯函数口径下 0013↔0080 的 sys 段落差异会换 trajectory/凭证亲和;
+    粘性绑定后首见即定格,演化不再断键。
+    """
+    sys_a = {"parts": [{"text": "You are Antigravity... <terminal_sandbox> 段"}]}
+    sys_b = {"parts": [{"text": "You are Antigravity... <artifacts> 段"}]}
+    msgs = [
+        {"role": "user", "parts": [{"text": "帮我重构这个模块"}]},
+        {"role": "model", "parts": [{"text": "好的"}]},
+        {"role": "user", "parts": [{"text": "继续"}]},
+    ]
+    k_birth = derive_session_key("gemini-4-carbon-medium", _req(msgs))
+    evolved = _req(msgs)
+    evolved["systemInstruction"] = sys_b
+    k_after = derive_session_key("gemini-4-carbon-medium", evolved)
+    assert k_birth == k_after, "sys 演化不得更换会话 key"
+
+
+def test_sticky_key_differs_without_sticky_hit():
+    """不同首条消息仍是不同 key(粘性只影响同基底会话)。"""
+    ka = derive_session_key(
+        "gemini-4-carbon-medium",
+        _req([{"role": "user", "parts": [{"text": "分析数据库慢查询"}]}]),
+    )
+    kb = derive_session_key(
+        "gemini-4-carbon-medium",
+        _req([{"role": "user", "parts": [{"text": "给前端写个组件"}]}]),
+    )
+    assert ka != kb
+
+
+def test_pure_anchor_remains_sys_sensitive():
+    """纯函数 `derive_conversation_anchor` 保持 sys 敏感(两层设计:粘性在消费方)。"""
+    msgs = [{"role": "user", "parts": [{"text": "继续"}]}]
+    r1 = _req(msgs)
+    r2 = _req(msgs)
+    r2["systemInstruction"] = {"parts": [{"text": "另一个 sys"}]}
+    d1 = derive_conversation_anchor("m", r1)
+    d2 = derive_conversation_anchor("m", r2)
+    assert d1 != d2

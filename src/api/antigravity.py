@@ -49,7 +49,11 @@ from src.model_enum import (
 from src.models import Model, model_to_dict
 from src.storage.database import get_database
 from src.utils import ANTIGRAVITY_USER_AGENT
-from src.session_cache import derive_conversation_anchor, derive_session_key
+from src.session_cache import (
+    _reset_sticky_anchor_memo,
+    derive_session_key,
+    resolve_sticky_anchor,
+)
 from src.usage_log import (
     extract_usage_tokens,
     new_request_id,
@@ -105,9 +109,12 @@ def _derive_upstream_session_ids(
     - sessionId：全体客户端恒等的常量（`OFFICIAL_SESSION_ID`，静态逆向证实
       = FNV-1a64 空输入 basis；实抓 163547/193455 跨会话同值），不再按凭证派生；
     - trajectory_id / cascade_id：逐对话派生——联合锚点 =
-      SHA256(model + systemInstruction 文本 + 前两条消息特征)，与
-      derive_session_key 同口径，保证同一会话跨轮次恒定（KV 缓存路由亲和）、
-      共用相同 systemInstruction 的不同会话不撞车：
+      SHA256(model + systemInstruction 文本 + 前两条消息特征)，经**粘性首见
+      绑定**（`resolve_sticky_anchor`）：sys 会随实验旗标/功能激活在会话内
+      演化（静态逆向证实，实抓 0013↔0080 段落不同），纯函数口径会让同一
+      会话中途换 trajectory——上游缓存亲和断裂、凭证亲和丢失、step/盖戳等
+      轨迹级状态归零。粘性绑定保证首见后恒定，与真实客户端"会话诞生时
+      确定 trajectory 后不再变化"的语义一致：
       - 摘要（混入账号盐后）8~24 字节 → 16 字节确定性 UUID 形态 trajectory_id；
       - ``sha256("cascade:" + 摘要)[:16]`` → cascade_id（实测 cascade_id 与
         root_cascade_id 同值，且等于 requestId 第 2 段；与 trajectory_id 不同源）。
@@ -115,7 +122,8 @@ def _derive_upstream_session_ids(
     无锚点（如空对话）时 trajectory/cascade 为空，由调用方兜底；sessionId 恒有值。
     """
     session_id = _derive_install_session_id(account_salt)
-    digest = derive_conversation_anchor(model, gemini_request)
+    # 粘性解析（首见绑定）：进程内 LRU+TTL，重启丢失后按当前 sys 重新绑定一次
+    digest = resolve_sticky_anchor(model, gemini_request, account_salt)
     if digest is None:
         return UpstreamSessionIds(session_id, "", "")
     if account_salt:
@@ -172,10 +180,12 @@ _MAX_TRACKED_TRAJECTORIES = 2048
 
 
 def _reset_trajectory_request_seq() -> None:
-    """清空轨迹计数器(仅供测试;覆盖 request_seq、step 重发状态与 user 轮盖戳)。"""
+    """清空轨迹计数器(仅供测试;覆盖 request_seq、step 重发状态、user 轮盖戳
+    与粘性锚点绑定)。"""
     with _TRAJECTORY_COUNTERS_LOCK:
         _TRAJECTORY_COUNTERS.clear()
     _reset_user_turn_time_registry()
+    _reset_sticky_anchor_memo()
 
 
 def _reset_trajectory_step_state() -> None:

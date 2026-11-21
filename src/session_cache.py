@@ -139,6 +139,11 @@ def derive_conversation_anchor(
     必须在格式转换完成后调用（openai2gemini / anthropic2gemini / 原生 gemini 都已
     转成 Gemini 格式），保证不同 API 格式的相同内容派生相同的锚点。
 
+    注意：这是**纯函数**（不含粘性状态）。生产路径请用
+    `resolve_sticky_anchor`——systemInstruction 会随实验旗标/功能激活在会话内
+    演化（静态逆向 2026-11-21：模板 `{{if .ExperimentEnabled ...}}` 门控），
+    纯函数口径会导致同一会话中途换 key/trajectory。
+
     Returns:
         32 字节 SHA256 摘要；无法派生锚点时返回 None
     """
@@ -177,10 +182,113 @@ def derive_conversation_anchor(
     return hashlib.sha256(anchor_material.encode("utf-8")).digest()
 
 
+# ====================== 粘性锚点（首见绑定） ======================
+# §10.14:真实客户端的 trajectory/cascade 在会话诞生时确定后不再变化;而
+# systemInstruction 会随实验旗标/功能激活在会话内演化(静态逆向 2026-11-21:
+# Go text/template 的 {{if .ExperimentEnabled}} 门控,实抓 163547 的 0013 与
+# 0080 段落不同)。把 sys 全文放进锚点会使同一会话中途换 key——上游缓存
+# 亲和断裂、凭证亲和丢失、step/盖戳等轨迹级状态归零。
+# 粘性绑定:锚点键剔除 sys(= 模型 + 前两条消息特征),**首次见到**时按全量
+# 锚点(含 sys,保留诞生时的碰撞隔离口径)派生并登记,此后沿用首见绑定。
+# 代价:同 (模型,前两条消息) 但不同 sys 的两个会话会合并到首见绑定(旧行为
+# 仅在 sys 也相同时才撞车);相比"每个 sys 演化的长会话必断锚"是净收益。
+# 进程内 LRU + TTL,与轨迹计数器同一失败模式(重启丢失→按当前 sys 重新
+# 绑定一次,此后稳定)。
+
+_STICKY_MEMO_TTL = 12 * 3600
+_STICKY_MEMO_MAX = 4096
+_sticky_memo: "Dict[str, tuple]" = {}  # sticky_key -> (digest, bound_at)
+_sticky_memo_order: List[str] = []  # FIFO 淘汰序(插入序),与 dict 并行维护
+
+
+def _sticky_base_digest(
+    model_name: str, gemini_request: Dict[str, Any]
+) -> Optional[bytes]:
+    """粘性键基底: SHA256(model + 首条消息特征),不含 systemInstruction。
+
+    取首条(而非前两条)消息:首轮请求只有一条消息,第二轮起 contents[:2]
+    变为 [首条 user, 首条 model]——纯函数锚点从第 2 条请求起必然变化
+    (test_sys_evolution_keeps_trajectory_continuous 暴露的既有 bug:
+    每个会话的第 1 条请求与后续请求本来就派生不同 trajectory)。首条
+    消息是会话身份的稳定核心,追加历史/模型回复都不影响它。
+    """
+    if not isinstance(gemini_request, dict):
+        return None
+    model_part = model_name if isinstance(model_name, str) else ""
+    message_features: List[str] = []
+    contents = gemini_request.get("contents")
+    if isinstance(contents, list):
+        for content in contents[:1]:
+            feature = _anchor_message_features(content)
+            if feature is not None:
+                message_features.append(feature)
+    messages_part = "\x1f".join(message_features)
+    if not messages_part:
+        return None
+    return hashlib.sha256(
+        f"{model_part}\x1e{messages_part}".encode("utf-8")
+    ).digest()
+
+
+def resolve_sticky_anchor(
+    model_name: str, gemini_request: Dict[str, Any], account_salt: str = ""
+) -> Optional[bytes]:
+    """粘性解析会话锚点摘要:首见按全量锚点派生,此后沿用首见绑定。
+
+    - 无消息特征(空对话)时退化为纯函数口径;
+    - ``account_salt`` 混入粘性键:不同凭证不共享绑定(与 trajectory 派生的
+      账号隔离一致);返回值仍是**未混盐**的全量摘要,盐由调用方按原口径追加;
+    - 绑定项带 TTL(空闲长会话过期后按当前 sys 重新绑定一次)与 FIFO 容量上限。
+    """
+    full = derive_conversation_anchor(model_name, gemini_request)
+    if full is None:
+        return None
+    base = _sticky_base_digest(model_name, gemini_request)
+    if base is None:
+        return full
+    sticky_key = hashlib.sha256(
+        (account_salt or "").encode("utf-8") + b"|" + base
+    ).hexdigest()
+    now = _now()
+    entry = _sticky_memo.get(sticky_key)
+    if entry is not None and now - entry[1] < _STICKY_MEMO_TTL:
+        # LRU 触碰:移到队尾
+        try:
+            _sticky_memo_order.remove(sticky_key)
+        except ValueError:
+            pass
+        _sticky_memo_order.append(sticky_key)
+        return entry[0]
+    if entry is None:
+        _sticky_memo[sticky_key] = (full, now)
+        _sticky_memo_order.append(sticky_key)
+    else:
+        # TTL 过期:按当前 sys 重新绑定
+        entry = (full, now)
+        _sticky_memo[sticky_key] = entry
+    # 容量维护:先清过期,再 FIFO 淘汰最旧
+    while len(_sticky_memo_order) > _STICKY_MEMO_MAX:
+        oldest = _sticky_memo_order.pop(0)
+        _sticky_memo.pop(oldest, None)
+    return _sticky_memo[sticky_key][0]
+
+
+def sticky_memo_size() -> int:
+    """粘性锚点绑定数(观测用)。"""
+    return len(_sticky_memo)
+
+
+def _reset_sticky_anchor_memo() -> None:
+    """清空粘性锚点绑定(仅供测试)。"""
+    _sticky_memo.clear()
+    _sticky_memo_order.clear()
+
+
 def derive_session_key(model_name: str, gemini_request: Dict[str, Any]) -> Optional[str]:
     """
     从规范化后的 Gemini 请求派生会话 key:
-    hash(模型 + systemInstruction 文本 + 前两条消息特征)
+    hash(模型 + systemInstruction 文本 + 前两条消息特征),经粘性首见绑定
+    (sys 会话内演化不断 key,见 `resolve_sticky_anchor`)。
 
     必须在格式转换完成后调用（openai2gemini / anthropic2gemini / 原生 gemini 都已
     转成 Gemini 格式），保证不同 API 格式的相同内容派生相同的 key。
@@ -188,7 +296,7 @@ def derive_session_key(model_name: str, gemini_request: Dict[str, Any]) -> Optio
     Returns:
         "auto:<hash>" 或 None（无法派生时）
     """
-    digest = derive_conversation_anchor(model_name, gemini_request)
+    digest = resolve_sticky_anchor(model_name, gemini_request)
     if digest is None:
         return None
     return f"auto:{digest.hex()[:32]}"
